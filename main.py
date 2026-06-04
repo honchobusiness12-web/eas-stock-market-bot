@@ -2,6 +2,7 @@ import os
 import math
 import json
 import asyncio
+import datetime
 from typing import Optional, List, Dict, Any
 
 import asyncpg
@@ -13,8 +14,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+_raw_db_url = os.getenv("DATABASE_URL", "")
+# Strip any Railway-style reference placeholders that were not resolved.
+# A properly resolved URL starts with postgres:// or postgresql://.
+if _raw_db_url.startswith("${{") or not _raw_db_url:
+    DATABASE_URL: Optional[str] = None
+else:
+    # asyncpg requires the postgresql:// scheme; convert postgres:// if needed.
+    DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1) if _raw_db_url.startswith("postgres://") else _raw_db_url
+
 DEVELOPER_USER_ID = int(os.getenv("DEVELOPER_USER_ID", "733871667788644445"))
+TESTING_SERVER_ID = int(os.getenv("TESTING_SERVER_ID", "1511958538333851688"))
+MAIN_SERVER_ID = int(os.getenv("MAIN_SERVER_ID", "1467697766837915804"))
 
 STAFF_ROLE_IDS = {
     1473033115818786909,
@@ -29,12 +40,12 @@ DAILY_SP = int(os.getenv("DAILY_SP", "1000"))
 SELL_TAX = float(os.getenv("SELL_TAX", "0.03"))
 MAX_OWNERSHIP_PERCENT = float(os.getenv("MAX_OWNERSHIP_PERCENT", "0.25"))
 MAX_MARKET_PLAYERS = 10
-TOP10_SYNC_MINUTES = int(os.getenv("TOP10_SYNC_MINUTES", "5"))
+# Changed default from 5 to 10 minutes for smoother sync cadence.
+TOP10_SYNC_MINUTES = int(os.getenv("TOP10_SYNC_MINUTES", "10"))
 
-# Existing ranked bot database source.
-# This expects the EAS ranked bot table format you used before:
-# players(guild_id, user_id, data JSON/JSONB)
-# data contains fields like cr, wins, losses, kills, mvps/mvps, streak.
+# Ranked bot database source — auto-detected on startup; env vars used as fallback.
+# Expected table format: players(guild_id, user_id, data JSON/JSONB)
+# data contains fields like cr, wins, losses, kills, mvps, streak.
 RANKED_PLAYERS_TABLE = os.getenv("RANKED_PLAYERS_TABLE", "players")
 RANKED_USER_ID_COLUMN = os.getenv("RANKED_USER_ID_COLUMN", "user_id")
 RANKED_GUILD_ID_COLUMN = os.getenv("RANKED_GUILD_ID_COLUMN", "guild_id")
@@ -44,6 +55,7 @@ intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 db_pool: Optional[asyncpg.Pool] = None
+bot_start_time: Optional[datetime.datetime] = None
 
 
 def money(n: int) -> str:
@@ -120,11 +132,129 @@ def result_percent(win: bool, mvp: bool, high_kills: bool, upset: bool) -> float
     return pct
 
 
+async def detect_ranked_schema(pool: asyncpg.Pool) -> Dict[str, str]:
+    """
+    Auto-detect the ranked players table structure by querying information_schema.
+    Returns a dict with keys: table, user_id_col, guild_id_col, data_col.
+    Falls back to the env-var configured values if detection fails.
+    """
+    global RANKED_PLAYERS_TABLE, RANKED_USER_ID_COLUMN, RANKED_GUILD_ID_COLUMN, RANKED_DATA_COLUMN
+
+    detected: Dict[str, str] = {
+        "table": RANKED_PLAYERS_TABLE,
+        "user_id_col": RANKED_USER_ID_COLUMN,
+        "guild_id_col": RANKED_GUILD_ID_COLUMN,
+        "data_col": RANKED_DATA_COLUMN,
+    }
+
+    try:
+        async with pool.acquire() as db:
+            # Step 1: find tables whose name contains 'player'.
+            tables = await db.fetch("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name ILIKE '%player%'
+            ORDER BY table_name;
+            """)
+
+            if not tables:
+                # Broaden search — any table that might hold ranked data.
+                tables = await db.fetch("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public'
+                ORDER BY table_name;
+                """)
+
+            candidate_table: Optional[str] = None
+            for t in tables:
+                tname = t["table_name"]
+                # Prefer tables named exactly 'players' or containing 'player'.
+                if tname == "players" or "player" in tname.lower():
+                    candidate_table = tname
+                    break
+
+            if not candidate_table:
+                print("[Schema] No player table found; using env-var defaults.")
+                return detected
+
+            # Step 2: inspect columns of the candidate table.
+            cols = await db.fetch("""
+            SELECT column_name, data_type FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = $1
+            ORDER BY ordinal_position;
+            """, candidate_table)
+
+            col_names = [c["column_name"] for c in cols]
+            col_types = {c["column_name"]: c["data_type"] for c in cols}
+
+            def find_col(candidates: List[str]) -> Optional[str]:
+                for candidate in candidates:
+                    for col in col_names:
+                        if col.lower() == candidate.lower():
+                            return col
+                # Partial match fallback.
+                for candidate in candidates:
+                    for col in col_names:
+                        if candidate.lower() in col.lower():
+                            return col
+                return None
+
+            user_col = find_col(["user_id", "userid", "discord_id", "member_id"])
+            guild_col = find_col(["guild_id", "guildid", "server_id"])
+            data_col = find_col(["data", "stats", "player_data", "ranked_data"])
+            cr_col = find_col(["cr", "rank", "rating", "elo"])
+
+            # If no JSON data column found, look for JSONB/JSON typed columns.
+            if not data_col:
+                for col, dtype in col_types.items():
+                    if dtype in ("json", "jsonb"):
+                        data_col = col
+                        break
+
+            # Verify the table is actually queryable.
+            test_query = f"SELECT 1 FROM {candidate_table} LIMIT 1;"
+            await db.fetchval(test_query)
+
+            if user_col:
+                detected["user_id_col"] = user_col
+            if guild_col:
+                detected["guild_id_col"] = guild_col
+            if data_col:
+                detected["data_col"] = data_col
+            detected["table"] = candidate_table
+
+            print(
+                f"[Schema] Auto-detected ranked table: '{candidate_table}' | "
+                f"user_id='{detected['user_id_col']}' guild_id='{detected['guild_id_col']}' "
+                f"data='{detected['data_col']}'"
+            )
+
+            # Update module-level globals so the rest of the code picks them up.
+            RANKED_PLAYERS_TABLE = detected["table"]
+            RANKED_USER_ID_COLUMN = detected["user_id_col"]
+            RANKED_GUILD_ID_COLUMN = detected["guild_id_col"]
+            RANKED_DATA_COLUMN = detected["data_col"]
+
+    except Exception as exc:
+        print(f"[Schema] Auto-detection failed ({exc}); using env-var defaults.")
+
+    return detected
+
+
 async def init_db() -> None:
     global db_pool
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing.")
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        raise RuntimeError(
+            "DATABASE_URL is missing or was not resolved. "
+            "Ensure the Railway variable reference is correctly linked."
+        )
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        # Validate the connection immediately.
+        async with db_pool.acquire() as _conn:
+            await _conn.fetchval("SELECT 1")
+        print("[DB] Connected to PostgreSQL successfully.")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to connect to PostgreSQL: {exc}") from exc
 
     async with db_pool.acquire() as db:
         await db.execute("""
@@ -202,6 +332,9 @@ async def init_db() -> None:
         );
         """)
 
+    # Run schema auto-detection after tables are created.
+    await detect_ranked_schema(db_pool)
+
 
 async def ensure_user(guild_id: int, user_id: int) -> None:
     assert db_pool is not None
@@ -264,11 +397,18 @@ async def update_price(guild_id: int, player_id: int, new_price: int, reason: st
 
 
 async def sync_top10_for_guild(guild: discord.Guild) -> int:
-    """Pull top 10 by CR from the existing ranked players table and update market listings."""
+    """
+    Pull top 10 by CR from the ranked players table and update market listings.
+    Only processes players belonging to this specific guild (guild_id filter).
+    Players entering the Top 10 get a new stock; players leaving are marked inactive
+    (all holdings and history are preserved). Price movements are smoothed with a
+    70/30 weighted average and boosted/penalised based on position delta.
+    """
     assert db_pool is not None
     guild_id = guild.id
 
-    # Use dynamic table/columns from env. These names are config-only, not user input.
+    # Use module-level globals (potentially updated by detect_ranked_schema).
+    # Column/table names come from config only — never from user input.
     query = f"""
     SELECT {RANKED_USER_ID_COLUMN} AS user_id, {RANKED_DATA_COLUMN} AS data
     FROM {RANKED_PLAYERS_TABLE}
@@ -281,16 +421,17 @@ async def sync_top10_for_guild(guild: discord.Guild) -> int:
         try:
             ranked_rows = await db.fetch(query, guild_id)
         except Exception as exc:
-            print(f"Top 10 sync failed for guild {guild_id}: {exc}")
+            print(f"[Sync] Top 10 sync failed for guild {guild_id}: {exc}")
             return 0
 
+        # Fetch all currently active stocks for this guild only.
         current_rows = await db.fetch("""
         SELECT player_id, price, rank_position FROM market_stocks
         WHERE guild_id=$1 AND active=true;
         """, guild_id)
         current = {int(r["player_id"]): r for r in current_rows}
 
-        new_ids = []
+        new_ids: List[int] = []
         updated_count = 0
 
         for index, row in enumerate(ranked_rows, start=1):
@@ -310,20 +451,27 @@ async def sync_top10_for_guild(guild: discord.Guild) -> int:
             cr = get_stat(data, "cr", "CR")
 
             if old:
+                # Player was already listed — apply smooth price transition.
                 old_position = int(old["rank_position"])
                 old_price = int(old["price"])
-                final_price = max(1000, int((old_price * 0.75) + (base_price * 0.25)))
 
-                if index < old_position:
-                    # Player passed someone and moved up.
-                    bump = 0.025 * (old_position - index)
-                    final_price = int(final_price * (1 + bump))
-                    reason = f"Top 10 sync: moved up from #{old_position} to #{index}"
-                elif index > old_position:
-                    drop = 0.02 * (index - old_position)
-                    final_price = int(final_price * (1 - drop))
-                    reason = f"Top 10 sync: moved down from #{old_position} to #{index}"
+                # Weighted average: 70% old price + 30% new calculated price.
+                blended_price = max(1000, int((old_price * 0.70) + (base_price * 0.30)))
+
+                position_delta = old_position - index  # positive = moved up
+
+                if position_delta > 0:
+                    # Moved up: 2–3% boost per position gained.
+                    boost = 0.025 * position_delta  # 2.5% per position (midpoint of 2–3%)
+                    final_price = max(1000, int(blended_price * (1 + boost)))
+                    reason = f"Top 10 sync: moved up from #{old_position} to #{index} (+{position_delta})"
+                elif position_delta < 0:
+                    # Moved down: 1–2% penalty per position lost.
+                    penalty = 0.015 * abs(position_delta)  # 1.5% per position (midpoint of 1–2%)
+                    final_price = max(1000, int(blended_price * (1 - penalty)))
+                    reason = f"Top 10 sync: moved down from #{old_position} to #{index} ({position_delta})"
                 else:
+                    final_price = blended_price
                     reason = "Top 10 sync: stats updated"
 
                 await db.execute("""
@@ -339,16 +487,22 @@ async def sync_top10_for_guild(guild: discord.Guild) -> int:
                     VALUES ($1, $2, $3, $4, $5);
                     """, guild_id, player_id, old_price, final_price, reason)
             else:
+                # New entrant — create stock with placement bonus baked into base_price.
+                # base_price_from_ranked_data already includes (11 - place) * 2500 bonus.
                 await db.execute("""
                 INSERT INTO market_stocks
-                (guild_id, player_id, price, rank_position, previous_rank_position, active, wins, losses, kills, mvps, streak, cr)
+                (guild_id, player_id, price, rank_position, previous_rank_position, active,
+                 wins, losses, kills, mvps, streak, cr)
                 VALUES ($1, $2, $3, $4, NULL, true, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT (guild_id, player_id)
-                DO UPDATE SET price=$3, rank_position=$4, active=true, wins=$5, losses=$6, kills=$7, mvps=$8, streak=$9, cr=$10, updated_at=NOW();
+                DO UPDATE SET price=$3, rank_position=$4, active=true,
+                    wins=$5, losses=$6, kills=$7, mvps=$8, streak=$9, cr=$10, updated_at=NOW();
                 """, guild_id, player_id, base_price, index, wins, losses, kills, mvps, streak, cr)
 
             updated_count += 1
 
+        # Mark players who dropped out of the Top 10 as inactive.
+        # Holdings and history are preserved — only active flag changes.
         if new_ids:
             await db.execute("""
             UPDATE market_stocks SET active=false
@@ -362,17 +516,28 @@ async def sync_top10_for_guild(guild: discord.Guild) -> int:
 
 @tasks.loop(minutes=TOP10_SYNC_MINUTES)
 async def top10_sync_loop():
+    # Only sync guilds the bot is actually in; guild_id filter inside the function
+    # ensures testing and production data never mix.
     for guild in bot.guilds:
         await sync_top10_for_guild(guild)
 
 
 @bot.event
 async def on_ready():
+    global bot_start_time
+    bot_start_time = datetime.datetime.utcnow()
+
     await init_db()
+
     if not top10_sync_loop.is_running():
         top10_sync_loop.start()
-    await bot.tree.sync()
-    print(f"EAS Stock Market Bot online as {bot.user}")
+
+    # Sync slash commands only to the testing server during development.
+    # TODO: add discord.Object(MAIN_SERVER_ID) here once testing is complete,
+    #       then remove the guild-specific sync and call bot.tree.sync() globally.
+    testing_guild = discord.Object(id=TESTING_SERVER_ID)
+    await bot.tree.sync(guild=testing_guild)
+    print(f"[Ready] EAS Stock Market Bot online as {bot.user} | Commands synced to testing server {TESTING_SERVER_ID}")
 
 
 async def send_embed(interaction: discord.Interaction, title: str, description: str, color=discord.Color.blurple(), ephemeral=False):
@@ -383,7 +548,33 @@ async def send_embed(interaction: discord.Interaction, title: str, description: 
 @bot.tree.command(name="ping", description="Check if the EAS Stock Market Bot is online.")
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
-    await send_embed(interaction, "🏓 Pong", f"Bot is online. Latency: **{latency}ms**", discord.Color.green())
+
+    # Database connection check.
+    db_status = "❌ Disconnected"
+    if db_pool is not None:
+        try:
+            async with db_pool.acquire() as _conn:
+                await _conn.fetchval("SELECT 1")
+            db_status = "✅ Connected"
+        except Exception:
+            db_status = "⚠️ Error"
+
+    # Uptime calculation.
+    if bot_start_time is not None:
+        delta = datetime.datetime.utcnow() - bot_start_time
+        total_seconds = int(delta.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_str = f"{hours}h {minutes}m {seconds}s"
+    else:
+        uptime_str = "Unknown"
+
+    desc = (
+        f"**Latency:** {latency}ms\n"
+        f"**Database:** {db_status}\n"
+        f"**Uptime:** {uptime_str}"
+    )
+    await send_embed(interaction, "🏓 Pong", desc, discord.Color.green())
 
 
 @bot.tree.command(name="marketcommands", description="View EAS stock market commands by page.")
