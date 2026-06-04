@@ -1,1 +1,1 @@
-worker: python main.py
+worker: python scripts/run_migrations.py && python main.py
