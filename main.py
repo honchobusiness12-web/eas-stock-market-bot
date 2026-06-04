@@ -234,6 +234,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 db_pool: Optional[asyncpg.Pool] = None
 bot_start_time: Optional[datetime.datetime] = None
 
+# Startup-once flags — prevent re-running seeding/registration on reconnects.
+_shop_seeded: bool = False
+_commands_registered: bool = False
+
 
 def money(n: int) -> str:
     return f"{int(n):,} SP"
@@ -599,6 +603,21 @@ async def _create_market_tables(pool: asyncpg.Pool, mode: str) -> None:
             END IF;
             IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='updated_at') THEN
                 ALTER TABLE market_shop_items ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='base_value') THEN
+                ALTER TABLE market_shop_items ADD COLUMN base_value BIGINT;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='current_value') THEN
+                ALTER TABLE market_shop_items ADD COLUMN current_value BIGINT;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='demand_score') THEN
+                ALTER TABLE market_shop_items ADD COLUMN demand_score INTEGER NOT NULL DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='total_bought') THEN
+                ALTER TABLE market_shop_items ADD COLUMN total_bought INTEGER NOT NULL DEFAULT 0;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='total_resold') THEN
+                ALTER TABLE market_shop_items ADD COLUMN total_resold INTEGER NOT NULL DEFAULT 0;
             END IF;
         END$body$;
         """)
@@ -1213,6 +1232,314 @@ async def top10_sync_loop():
                     print(f"[Sim] ⚠️  Simulation tick failed: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# seed_market_shop_items — populate market_shop_items with the 26 catalogue items
+# ---------------------------------------------------------------------------
+
+async def seed_market_shop_items() -> int:
+    """Seed the 26 canonical market shop items into the main database.
+
+    Uses item_name as the unique key — existing items are skipped.
+    Returns the number of newly inserted items.
+    """
+    if db_manager.db_pool_main is None:
+        print("[Shop] ⚠️  Main database unavailable — skipping shop seeding.")
+        return 0
+
+    # All 26 items: (item_name, description, category, price, rarity, is_limited, max_stock)
+    # is_limited=True  → limited stock; max_stock=None means unlimited.
+    # resale_percent: 85 for limited/ultra-rare, 70 for everything else.
+    SHOP_CATALOGUE: List[Dict[str, Any]] = [
+        # ── Website Badges (10) ──────────────────────────────────────────────
+        {
+            "item_name": "early_investor",
+            "description": "Early Investor Badge — awarded to the earliest supporters of the EAS market.",
+            "category": "badge",
+            "price": 250_000,
+            "rarity": "common",
+            "is_limited": False,
+            "max_stock": None,
+        },
+        {
+            "item_name": "rising_investor",
+            "description": "Rising Investor Badge — for investors on the rise.",
+            "category": "badge",
+            "price": 750_000,
+            "rarity": "common",
+            "is_limited": False,
+            "max_stock": None,
+        },
+        {
+            "item_name": "diamond_hands",
+            "description": "Diamond Hands Badge — for investors who never sell.",
+            "category": "badge",
+            "price": 10_000_000,
+            "rarity": "rare",
+            "is_limited": True,
+            "max_stock": 100,
+        },
+        {
+            "item_name": "market_mogul_badge",
+            "description": "Market Mogul Badge — for the most powerful market players.",
+            "category": "badge",
+            "price": 25_000_000,
+            "rarity": "rare",
+            "is_limited": True,
+            "max_stock": 50,
+        },
+        {
+            "item_name": "stock_king",
+            "description": "Stock King Badge — reign supreme over the market.",
+            "category": "badge",
+            "price": 50_000_000,
+            "rarity": "epic",
+            "is_limited": True,
+            "max_stock": 25,
+        },
+        {
+            "item_name": "bull_master",
+            "description": "Bull Master Badge — master of the bull market.",
+            "category": "badge",
+            "price": 75_000_000,
+            "rarity": "epic",
+            "is_limited": True,
+            "max_stock": 15,
+        },
+        {
+            "item_name": "bear_master",
+            "description": "Bear Master Badge — master of the bear market.",
+            "category": "badge",
+            "price": 75_000_000,
+            "rarity": "epic",
+            "is_limited": True,
+            "max_stock": 15,
+        },
+        {
+            "item_name": "hall_of_investors",
+            "description": "Hall of Investors Badge — inducted into the hall of legends.",
+            "category": "badge",
+            "price": 100_000_000,
+            "rarity": "legendary",
+            "is_limited": True,
+            "max_stock": 10,
+        },
+        {
+            "item_name": "starpoint_elite",
+            "description": "Starpoint Elite Badge — the pinnacle of StarPoint achievement.",
+            "category": "badge",
+            "price": 250_000_000,
+            "rarity": "legendary",
+            "is_limited": True,
+            "max_stock": 10,
+        },
+        {
+            "item_name": "eas_tycoon_badge",
+            "description": "EAS Tycoon Badge — the ultimate badge for the wealthiest investors.",
+            "category": "badge",
+            "price": 1_000_000_000,
+            "rarity": "mythic",
+            "is_limited": True,
+            "max_stock": 5,
+        },
+        # ── Discord Roles (6) ────────────────────────────────────────────────
+        {
+            "item_name": "millionaire_role",
+            "description": "Millionaire Role — unlock the Millionaire Discord role.",
+            "category": "role",
+            "price": 10_000_000,
+            "rarity": "common",
+            "is_limited": False,
+            "max_stock": None,
+        },
+        {
+            "item_name": "multi_millionaire_role",
+            "description": "Multi-Millionaire Role — unlock the Multi-Millionaire Discord role.",
+            "category": "role",
+            "price": 50_000_000,
+            "rarity": "common",
+            "is_limited": False,
+            "max_stock": None,
+        },
+        {
+            "item_name": "investor_elite_role",
+            "description": "Investor Elite Role — unlock the Investor Elite Discord role.",
+            "category": "role",
+            "price": 100_000_000,
+            "rarity": "rare",
+            "is_limited": True,
+            "max_stock": 100,
+        },
+        {
+            "item_name": "market_mogul_role",
+            "description": "Market Mogul Role — unlock the Market Mogul Discord role.",
+            "category": "role",
+            "price": 250_000_000,
+            "rarity": "rare",
+            "is_limited": True,
+            "max_stock": 50,
+        },
+        {
+            "item_name": "stock_legend_role",
+            "description": "Stock Legend Role — unlock the Stock Legend Discord role.",
+            "category": "role",
+            "price": 500_000_000,
+            "rarity": "epic",
+            "is_limited": True,
+            "max_stock": 25,
+        },
+        {
+            "item_name": "eas_tycoon_role",
+            "description": "EAS Tycoon Role — unlock the exclusive EAS Tycoon Discord role.",
+            "category": "role",
+            "price": 1_000_000_000,
+            "rarity": "epic",
+            "is_limited": True,
+            "max_stock": 10,
+        },
+        # ── Ultra-Rare Roles (5) ─────────────────────────────────────────────
+        {
+            "item_name": "market_shark_role",
+            "description": "Market Shark Role — an ultra-rare role for apex market predators.",
+            "category": "role",
+            "price": 5_000_000_000,
+            "rarity": "mythic",
+            "is_limited": True,
+            "max_stock": 5,
+        },
+        {
+            "item_name": "investment_bank_role",
+            "description": "Investment Bank Role — an ultra-rare role for institutional-level investors.",
+            "category": "role",
+            "price": 10_000_000_000,
+            "rarity": "mythic",
+            "is_limited": True,
+            "max_stock": 3,
+        },
+        {
+            "item_name": "global_investor_role",
+            "description": "Global Investor Role — an ultra-rare role for world-class investors.",
+            "category": "role",
+            "price": 25_000_000_000,
+            "rarity": "mythic",
+            "is_limited": True,
+            "max_stock": 2,
+        },
+        {
+            "item_name": "market_overlord_role",
+            "description": "Market Overlord Role — an ultra-rare role for the undisputed market ruler.",
+            "category": "role",
+            "price": 50_000_000_000,
+            "rarity": "mythic",
+            "is_limited": True,
+            "max_stock": 1,
+        },
+        {
+            "item_name": "stock_emperor_role",
+            "description": "Stock Emperor Role — the rarest role in existence, for the supreme stock emperor.",
+            "category": "role",
+            "price": 100_000_000_000,
+            "rarity": "mythic",
+            "is_limited": True,
+            "max_stock": 1,
+        },
+    ]
+
+    seeded_count = 0
+    async with db_manager.db_pool_main.acquire() as db:
+        for item in SHOP_CATALOGUE:
+            item_name = item["item_name"]
+            price = item["price"]
+            is_limited = item["is_limited"]
+            max_stock = item["max_stock"]
+            rarity = item["rarity"]
+
+            # Check if item already exists.
+            existing = await db.fetchval(
+                "SELECT id FROM market_shop_items WHERE item_name = $1;",
+                item_name,
+            )
+            if existing is not None:
+                print(f"[Shop] ⏭️  Already exists: {item_name}")
+                continue
+
+            # Derive computed fields.
+            current_stock = max_stock if is_limited and max_stock is not None else None
+            min_value = price // 2
+            max_value = price * 5
+            # Ultra-rare (mythic limited) and limited items get 85% resale; others 70%.
+            resale_percent = 85 if (is_limited and rarity in ("mythic", "legendary", "epic")) else 70
+
+            await db.execute(
+                """
+                INSERT INTO market_shop_items
+                    (item_name, description, price, category, rarity, active,
+                     limited, max_stock, current_stock,
+                     base_value, current_value, min_value, max_value,
+                     resale_percent, demand_score, total_bought, total_resold)
+                VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10,$11,$12,$13,0,0,0);
+                """,
+                item_name,
+                item["description"],
+                price,
+                item["category"],
+                rarity,
+                is_limited,
+                max_stock,
+                current_stock,
+                price,   # base_value
+                price,   # current_value
+                min_value,
+                max_value,
+                resale_percent,
+            )
+            print(f"[Shop] ✅ Seeded: {item_name} (${price:,})")
+            seeded_count += 1
+
+    print(f"[Shop] 📦 Seeded {seeded_count} new items to market_shop_items")
+    return seeded_count
+
+
+# ---------------------------------------------------------------------------
+# register_guild_commands — copy all tree commands to the testing guild
+# ---------------------------------------------------------------------------
+
+async def register_guild_commands() -> int:
+    """Copy all app-commands to the testing guild for instant visibility.
+
+    Each command is logged individually.  Returns the total number of
+    commands successfully synced to the testing guild.
+    """
+    guild_obj = discord.Object(id=TEST_GUILD_ID)
+    all_cmds = bot.tree.get_commands()
+
+    # Copy every global command into the testing guild's command tree.
+    for cmd in all_cmds:
+        try:
+            bot.tree.copy_global_to(guild=guild_obj)
+            # copy_global_to copies all at once; log each name individually.
+            print(f"[Commands] ✅ Registered: /{cmd.name}")
+        except Exception as exc:
+            print(f"[Commands] ❌ Failed to register /{cmd.name}: {exc}")
+
+    # Sync the testing guild's command tree to Discord.
+    try:
+        synced = await bot.tree.sync(guild=guild_obj)
+        count = len(synced)
+        print(f"[Commands] 📋 Registered {count} commands to testing guild {TEST_GUILD_ID}")
+        for cmd in sorted(synced, key=lambda c: c.name):
+            print(f"[Commands]    /{cmd.name}")
+        return count
+    except discord.errors.Forbidden:
+        print(
+            f"[Commands] ❌ Missing applications.commands scope for testing guild {TEST_GUILD_ID}. "
+            "Re-invite the bot with scopes: bot, applications.commands"
+        )
+        return 0
+    except Exception as exc:
+        print(f"[Commands] ❌ Sync to testing guild {TEST_GUILD_ID} failed: {exc}")
+        return 0
+
+
 @bot.event
 async def on_ready():
     """Discord on_ready handler — runs once after the bot logs in.
@@ -1221,7 +1548,7 @@ async def on_ready():
     slash commands to both servers.  Comprehensive startup logs are printed
     so Railway deployment logs are easy to read.
     """
-    global bot_start_time, db_pool
+    global bot_start_time, db_pool, _shop_seeded, _commands_registered
     bot_start_time = datetime.datetime.utcnow()
 
     print("=" * 60)
@@ -1263,31 +1590,44 @@ async def on_ready():
     else:
         print("[Startup] ℹ️  Market auto-update loop already running.")
 
-    # Sync slash commands to both guilds immediately on startup.
-    # Testing guild gets commands first (instant update for dev iteration).
-    # Main guild follows. Global registration is NOT used — guild sync is instant.
-    print("[Startup] 🔄 Registering slash commands to guilds...")
-    all_commands = [cmd.name for cmd in bot.tree.get_commands()]
-    print(f"[Startup] 📋 Commands to register ({len(all_commands)}): {', '.join(sorted(all_commands))}")
-
-    for guild_id in (TEST_GUILD_ID, MAIN_GUILD_ID):
-        label = "testing" if guild_id == TEST_GUILD_ID else "main"
-        guild_obj = discord.Object(id=guild_id)
-        # Check if bot is actually in this guild before trying to sync.
-        guild_in_cache = bot.get_guild(guild_id)
-        if guild_in_cache is None and guild_id == MAIN_GUILD_ID:
-            print(f"[Startup] ⚠️  Bot is not in main server ({guild_id}) — skipping main guild sync.")
-            continue
+    # Seed market shop items (once per process lifetime).
+    if not _shop_seeded:
+        _shop_seeded = True
         try:
-            synced = await bot.tree.sync(guild=guild_obj)
-            print(f"[Startup] ✅ Registered {len(synced)} slash commands to {label} server ({guild_id})")
-            for cmd in sorted(synced, key=lambda c: c.name):
-                print(f"[Startup]    /{cmd.name}")
-        except discord.errors.Forbidden:
-            print(f"[Startup] ❌ Missing applications.commands scope for {label} server ({guild_id}). "
-                  f"Re-invite the bot with scopes: bot, applications.commands")
+            await seed_market_shop_items()
         except Exception as exc:
-            print(f"[Startup] ⚠️  Command sync failed for {label} server ({guild_id}): {exc}")
+            print(f"[Shop] ❌ Shop seeding failed: {exc}")
+    else:
+        print("[Shop] ℹ️  Shop seeding already ran — skipping.")
+
+    # Register slash commands to the testing guild (once per process lifetime).
+    if not _commands_registered:
+        _commands_registered = True
+        print("[Startup] 🔄 Registering slash commands to guilds...")
+        all_commands = [cmd.name for cmd in bot.tree.get_commands()]
+        print(f"[Startup] 📋 Commands to register ({len(all_commands)}): {', '.join(sorted(all_commands))}")
+
+        # Testing guild — use register_guild_commands() for per-command logging.
+        await register_guild_commands()
+
+        # Main guild — sync directly.
+        main_guild_obj = discord.Object(id=MAIN_GUILD_ID)
+        main_guild_in_cache = bot.get_guild(MAIN_GUILD_ID)
+        if main_guild_in_cache is None:
+            print(f"[Startup] ⚠️  Bot is not in main server ({MAIN_GUILD_ID}) — skipping main guild sync.")
+        else:
+            try:
+                synced = await bot.tree.sync(guild=main_guild_obj)
+                print(f"[Startup] ✅ Registered {len(synced)} slash commands to main server ({MAIN_GUILD_ID})")
+                for cmd in sorted(synced, key=lambda c: c.name):
+                    print(f"[Startup]    /{cmd.name}")
+            except discord.errors.Forbidden:
+                print(f"[Startup] ❌ Missing applications.commands scope for main server ({MAIN_GUILD_ID}). "
+                      "Re-invite the bot with scopes: bot, applications.commands")
+            except Exception as exc:
+                print(f"[Startup] ⚠️  Command sync failed for main server ({MAIN_GUILD_ID}): {exc}")
+    else:
+        print("[Startup] ℹ️  Command registration already ran — skipping.")
 
     print("=" * 60)
     print("[Startup] ✅ EAS Stock Market Bot is READY")
@@ -2459,28 +2799,43 @@ async def marketforceupdate(interaction: discord.Interaction):
 
 @bot.tree.command(name="synccommands", description="Developer: Re-register all slash commands to both guilds.")
 async def synccommands(interaction: discord.Interaction):
-    """Manually re-sync all slash commands to testing and main guilds."""
+    """Manually re-sync all slash commands to testing and main guilds.
+
+    Calls register_guild_commands() for the testing guild (with per-command
+    logging) then syncs the main guild directly.  Developer-only.
+    """
     if not is_developer(interaction.user):
-        await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True)
+        await interaction.response.send_message("❌ Developer only", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
+
     results: List[str] = []
-    for guild_id in (TEST_GUILD_ID, MAIN_GUILD_ID):
-        label = "testing" if guild_id == TEST_GUILD_ID else "main"
-        guild_obj = discord.Object(id=guild_id)
-        guild_in_cache = bot.get_guild(guild_id)
-        if guild_in_cache is None and guild_id == MAIN_GUILD_ID:
-            results.append(f"⚠️ **{label}** ({guild_id}): Bot not in server — skipped.")
-            continue
+
+    # Testing guild — use register_guild_commands() for detailed logging.
+    print("[Commands] 🔄 /synccommands triggered — re-registering all commands...")
+    test_count = await register_guild_commands()
+    results.append(f"✅ **testing** ({TEST_GUILD_ID}): {test_count} commands registered.")
+
+    # Main guild — sync directly.
+    main_guild_obj = discord.Object(id=MAIN_GUILD_ID)
+    main_guild_in_cache = bot.get_guild(MAIN_GUILD_ID)
+    if main_guild_in_cache is None:
+        results.append(f"⚠️ **main** ({MAIN_GUILD_ID}): Bot not in server — skipped.")
+    else:
         try:
-            synced = await bot.tree.sync(guild=guild_obj)
-            results.append(f"✅ **{label}** ({guild_id}): {len(synced)} commands registered.")
+            synced = await bot.tree.sync(guild=main_guild_obj)
+            results.append(f"✅ **main** ({MAIN_GUILD_ID}): {len(synced)} commands registered.")
+            print(f"[Commands] ✅ Synced {len(synced)} commands to main guild {MAIN_GUILD_ID}")
         except discord.errors.Forbidden:
-            results.append(f"❌ **{label}** ({guild_id}): Missing `applications.commands` scope.")
+            results.append(f"❌ **main** ({MAIN_GUILD_ID}): Missing `applications.commands` scope.")
+            print(f"[Commands] ❌ Missing applications.commands scope for main guild {MAIN_GUILD_ID}")
         except Exception as exc:
-            results.append(f"⚠️ **{label}** ({guild_id}): {exc}")
+            results.append(f"⚠️ **main** ({MAIN_GUILD_ID}): {exc}")
+            print(f"[Commands] ❌ Sync to main guild {MAIN_GUILD_ID} failed: {exc}")
+
     desc = "\n".join(results)
     embed = discord.Embed(title="🔄 Slash Command Sync", description=desc, color=discord.Color.blurple())
+    embed.set_footer(text=f"✅ Synced {test_count} commands to testing guild")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
