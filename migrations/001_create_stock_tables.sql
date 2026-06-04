@@ -1,73 +1,112 @@
--- Stock Market Bot Tables
--- These tables are created in the SAME database as the ranked system
--- They do NOT modify or touch any existing ranked data
+-- EAS Stock Market Bot — Phase 1 Schema
+-- All tables use the market_ prefix.
+-- NO foreign key constraints reference the ranked players table.
+-- This file is kept for reference; the bot creates tables directly in init_db().
 
--- StarPoints balances for each player
-CREATE TABLE IF NOT EXISTS star_points (
-  id SERIAL PRIMARY KEY,
-  user_id TEXT NOT NULL UNIQUE,
-  balance DECIMAL(15, 2) NOT NULL DEFAULT 0,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (user_id) REFERENCES players(user_id) ON DELETE CASCADE
+-- User balances, daily claims, and wealth roles.
+-- guild_id + user_id are standalone — no FK to players.
+CREATE TABLE IF NOT EXISTS market_users (
+  guild_id    BIGINT NOT NULL,
+  user_id     BIGINT NOT NULL,
+  balance     BIGINT NOT NULL DEFAULT 250000,
+  last_daily  TIMESTAMP,
+  wealth_role TEXT,
+  PRIMARY KEY (guild_id, user_id)
 );
 
--- Stock holdings for each player
-CREATE TABLE IF NOT EXISTS holdings (
-  id SERIAL PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  stock_symbol TEXT NOT NULL,
-  quantity INTEGER NOT NULL DEFAULT 0,
-  average_cost DECIMAL(15, 2) NOT NULL DEFAULT 0,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE(user_id, stock_symbol),
-  FOREIGN KEY (user_id) REFERENCES players(user_id) ON DELETE CASCADE
+-- Top 10 player stock listings per guild.
+CREATE TABLE IF NOT EXISTS market_stocks (
+  guild_id               BIGINT NOT NULL,
+  player_id              BIGINT NOT NULL,
+  price                  BIGINT NOT NULL DEFAULT 1000,
+  rank_position          INTEGER NOT NULL,
+  active                 BOOLEAN NOT NULL DEFAULT TRUE,
+  cr                     INTEGER NOT NULL DEFAULT 0,
+  wins                   INTEGER NOT NULL DEFAULT 0,
+  losses                 INTEGER NOT NULL DEFAULT 0,
+  kills                  INTEGER NOT NULL DEFAULT 0,
+  mvps                   INTEGER NOT NULL DEFAULT 0,
+  streak                 INTEGER NOT NULL DEFAULT 0,
+  previous_rank_position INTEGER,
+  updated_at             TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (guild_id, player_id)
 );
 
--- Stock prices (one per player stock)
-CREATE TABLE IF NOT EXISTS stock_prices (
-  id SERIAL PRIMARY KEY,
-  stock_symbol TEXT NOT NULL UNIQUE,
-  player_user_id TEXT NOT NULL,
-  current_price DECIMAL(15, 2) NOT NULL DEFAULT 100,
-  previous_price DECIMAL(15, 2) NOT NULL DEFAULT 100,
-  price_change DECIMAL(15, 2) NOT NULL DEFAULT 0,
-  percent_change DECIMAL(5, 2) NOT NULL DEFAULT 0,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (player_user_id) REFERENCES players(user_id) ON DELETE CASCADE
+-- User share holdings.
+CREATE TABLE IF NOT EXISTS market_holdings (
+  guild_id      BIGINT NOT NULL,
+  investor_id   BIGINT NOT NULL,
+  player_id     BIGINT NOT NULL,
+  shares        INTEGER NOT NULL DEFAULT 0,
+  average_price BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, investor_id, player_id)
 );
 
--- Transaction history
-CREATE TABLE IF NOT EXISTS transactions (
-  id SERIAL PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  transaction_type TEXT NOT NULL, -- 'buy', 'sell', 'dividend', 'transfer'
-  stock_symbol TEXT,
-  quantity INTEGER,
-  price_per_unit DECIMAL(15, 2),
-  total_amount DECIMAL(15, 2) NOT NULL,
+-- Buy/sell/daily transaction history.
+CREATE TABLE IF NOT EXISTS market_transactions (
+  id          SERIAL PRIMARY KEY,
+  guild_id    BIGINT NOT NULL,
+  investor_id BIGINT NOT NULL,
+  player_id   BIGINT,
+  type        TEXT NOT NULL,
+  shares      INTEGER,
+  price       BIGINT,
+  total       BIGINT,
+  created_at  TIMESTAMP DEFAULT NOW()
+);
+
+-- Stock price change audit log.
+CREATE TABLE IF NOT EXISTS market_stock_history (
+  id         SERIAL PRIMARY KEY,
+  guild_id   BIGINT NOT NULL,
+  player_id  BIGINT NOT NULL,
+  old_price  BIGINT NOT NULL,
+  new_price  BIGINT NOT NULL,
+  reason     TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Per-guild market open/close flag.
+CREATE TABLE IF NOT EXISTS market_settings (
+  guild_id    BIGINT PRIMARY KEY,
+  market_open BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_at  TIMESTAMP DEFAULT NOW()
+);
+
+-- Global shop item catalogue.
+CREATE TABLE IF NOT EXISTS market_shop_items (
+  id          SERIAL PRIMARY KEY,
+  item_name   TEXT NOT NULL UNIQUE,
   description TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (user_id) REFERENCES players(user_id) ON DELETE CASCADE
+  price       BIGINT NOT NULL,
+  category    TEXT NOT NULL,
+  created_at  TIMESTAMP DEFAULT NOW()
 );
 
--- Stock price history for charting
-CREATE TABLE IF NOT EXISTS stock_history (
-  id SERIAL PRIMARY KEY,
-  stock_symbol TEXT NOT NULL,
-  price DECIMAL(15, 2) NOT NULL,
-  volume INTEGER DEFAULT 0,
-  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+-- Items purchased by users per guild.
+CREATE TABLE IF NOT EXISTS market_user_items (
+  id           SERIAL PRIMARY KEY,
+  guild_id     BIGINT NOT NULL,
+  user_id      BIGINT NOT NULL,
+  item_id      INTEGER NOT NULL,
+  purchased_at TIMESTAMP DEFAULT NOW()
 );
 
--- Create indexes for performance
-CREATE INDEX IF NOT EXISTS idx_star_points_user_id ON star_points(user_id);
-CREATE INDEX IF NOT EXISTS idx_holdings_user_id ON holdings(user_id);
-CREATE INDEX IF NOT EXISTS idx_holdings_stock ON holdings(stock_symbol);
-CREATE INDEX IF NOT EXISTS idx_stock_prices_symbol ON stock_prices(stock_symbol);
-CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);
-CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(transaction_type);
-CREATE INDEX IF NOT EXISTS idx_stock_history_symbol ON stock_history(stock_symbol);
-CREATE INDEX IF NOT EXISTS idx_stock_history_timestamp ON stock_history(timestamp);
+-- Wealth role assignment history.
+CREATE TABLE IF NOT EXISTS market_wealth_roles (
+  id          SERIAL PRIMARY KEY,
+  guild_id    BIGINT NOT NULL,
+  user_id     BIGINT NOT NULL,
+  role_name   TEXT NOT NULL,
+  threshold   BIGINT NOT NULL,
+  assigned_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Performance indexes.
+CREATE INDEX IF NOT EXISTS idx_market_users_guild      ON market_users(guild_id);
+CREATE INDEX IF NOT EXISTS idx_market_stocks_guild     ON market_stocks(guild_id, active);
+CREATE INDEX IF NOT EXISTS idx_market_holdings_inv     ON market_holdings(guild_id, investor_id);
+CREATE INDEX IF NOT EXISTS idx_market_transactions_inv ON market_transactions(guild_id, investor_id);
+CREATE INDEX IF NOT EXISTS idx_market_stock_history    ON market_stock_history(guild_id, player_id);
+CREATE INDEX IF NOT EXISTS idx_market_user_items       ON market_user_items(guild_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_market_wealth_roles     ON market_wealth_roles(guild_id, user_id);
