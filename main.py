@@ -539,16 +539,68 @@ async def _create_market_tables(pool: asyncpg.Pool, mode: str) -> None:
 
         # ------------------------------------------------------------------ #
         # market_shop_items — purchasable item definitions (global catalogue).
+        # Extended with rarity, stock, resale, badge/role linkage, and audit.
         # ------------------------------------------------------------------ #
         await db.execute("""
         CREATE TABLE IF NOT EXISTS market_shop_items (
-            id          SERIAL PRIMARY KEY,
-            item_name   TEXT NOT NULL UNIQUE,
-            description TEXT,
-            price       BIGINT NOT NULL,
-            category    TEXT NOT NULL,
-            created_at  TIMESTAMP DEFAULT NOW()
+            id              SERIAL PRIMARY KEY,
+            item_name       TEXT NOT NULL UNIQUE,
+            description     TEXT,
+            price           BIGINT NOT NULL,
+            category        TEXT NOT NULL,
+            rarity          TEXT NOT NULL DEFAULT 'common',
+            active          BOOLEAN NOT NULL DEFAULT TRUE,
+            limited         BOOLEAN NOT NULL DEFAULT FALSE,
+            max_stock       INTEGER,
+            current_stock   INTEGER,
+            min_value       BIGINT,
+            max_value       BIGINT,
+            resale_percent  INTEGER NOT NULL DEFAULT 70,
+            badge_id        TEXT,
+            role_id         BIGINT,
+            created_at      TIMESTAMP DEFAULT NOW(),
+            updated_at      TIMESTAMP DEFAULT NOW()
         );
+        """)
+
+        # Non-destructive migrations for existing market_shop_items rows.
+        await db.execute("""
+        DO $body$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='rarity') THEN
+                ALTER TABLE market_shop_items ADD COLUMN rarity TEXT NOT NULL DEFAULT 'common';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='active') THEN
+                ALTER TABLE market_shop_items ADD COLUMN active BOOLEAN NOT NULL DEFAULT TRUE;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='limited') THEN
+                ALTER TABLE market_shop_items ADD COLUMN limited BOOLEAN NOT NULL DEFAULT FALSE;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='max_stock') THEN
+                ALTER TABLE market_shop_items ADD COLUMN max_stock INTEGER;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='current_stock') THEN
+                ALTER TABLE market_shop_items ADD COLUMN current_stock INTEGER;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='min_value') THEN
+                ALTER TABLE market_shop_items ADD COLUMN min_value BIGINT;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='max_value') THEN
+                ALTER TABLE market_shop_items ADD COLUMN max_value BIGINT;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='resale_percent') THEN
+                ALTER TABLE market_shop_items ADD COLUMN resale_percent INTEGER NOT NULL DEFAULT 70;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='badge_id') THEN
+                ALTER TABLE market_shop_items ADD COLUMN badge_id TEXT;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='role_id') THEN
+                ALTER TABLE market_shop_items ADD COLUMN role_id BIGINT;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_shop_items' AND column_name='updated_at') THEN
+                ALTER TABLE market_shop_items ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
+            END IF;
+        END$body$;
         """)
 
         # ------------------------------------------------------------------ #
@@ -577,6 +629,96 @@ async def _create_market_tables(pool: asyncpg.Pool, mode: str) -> None:
             assigned_at TIMESTAMP DEFAULT NOW()
         );
         """)
+
+        # ------------------------------------------------------------------ #
+        # badge_definitions — canonical badge registry (source of truth).
+        # ------------------------------------------------------------------ #
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS badge_definitions (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            description TEXT,
+            category    TEXT NOT NULL DEFAULT 'market',
+            rarity      TEXT NOT NULL DEFAULT 'common',
+            icon_url    TEXT,
+            visible     BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at  TIMESTAMP DEFAULT NOW()
+        );
+        """)
+
+        # ------------------------------------------------------------------ #
+        # player_badges — badges awarded to users.
+        # ------------------------------------------------------------------ #
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS player_badges (
+            id          SERIAL PRIMARY KEY,
+            guild_id    BIGINT NOT NULL,
+            user_id     BIGINT NOT NULL,
+            badge_id    TEXT NOT NULL REFERENCES badge_definitions(id) ON DELETE CASCADE,
+            awarded_at  TIMESTAMP DEFAULT NOW(),
+            awarded_by  BIGINT,
+            source      TEXT NOT NULL DEFAULT 'system',
+            UNIQUE(guild_id, user_id, badge_id)
+        );
+        """)
+
+        # ------------------------------------------------------------------ #
+        # market_shop_audit — audit log for all shop admin actions.
+        # ------------------------------------------------------------------ #
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS market_shop_audit (
+            id          SERIAL PRIMARY KEY,
+            item_id     INTEGER,
+            item_name   TEXT,
+            action      TEXT NOT NULL,
+            changed_by  BIGINT NOT NULL,
+            old_value   TEXT,
+            new_value   TEXT,
+            field       TEXT,
+            note        TEXT,
+            created_at  TIMESTAMP DEFAULT NOW()
+        );
+        """)
+
+        # ------------------------------------------------------------------ #
+        # market_item_value_history — price change history per shop item.
+        # ------------------------------------------------------------------ #
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS market_item_value_history (
+            id          SERIAL PRIMARY KEY,
+            item_id     INTEGER NOT NULL,
+            old_price   BIGINT NOT NULL,
+            new_price   BIGINT NOT NULL,
+            changed_by  BIGINT NOT NULL,
+            reason      TEXT,
+            created_at  TIMESTAMP DEFAULT NOW()
+        );
+        """)
+
+        # ------------------------------------------------------------------ #
+        # Seed badge_definitions from badge_manifest.json.
+        # ------------------------------------------------------------------ #
+        try:
+            import pathlib
+            manifest_path = pathlib.Path(__file__).parent / "badge_manifest.json"
+            if manifest_path.exists():
+                with open(manifest_path) as f:
+                    badge_manifest = json.load(f)
+                badges_seeded = 0
+                for badge in badge_manifest:
+                    result = await db.execute("""
+                    INSERT INTO badge_definitions (id, name, description, category, rarity, icon_url, visible)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (id) DO UPDATE SET
+                        name=$2, description=$3, category=$4, rarity=$5, icon_url=$6, visible=$7;
+                    """, badge["id"], badge["name"], badge.get("description", ""),
+                        badge.get("category", "market"), badge.get("rarity", "common"),
+                        badge.get("icon_url", ""), badge.get("visible", True))
+                    if result and "INSERT" in result:
+                        badges_seeded += 1
+                print(f"[Badges/{mode}] ✅ Badge manifest synced ({len(badge_manifest)} badges).")
+        except Exception as exc:
+            print(f"[Badges/{mode}] ⚠️  Badge manifest sync failed: {exc}")
 
         # ------------------------------------------------------------------ #
         # Seed default shop items (INSERT … ON CONFLICT DO NOTHING).
@@ -1121,17 +1263,31 @@ async def on_ready():
     else:
         print("[Startup] ℹ️  Market auto-update loop already running.")
 
-    # Sync slash commands to both servers.
-    synced_count = 0
+    # Sync slash commands to both guilds immediately on startup.
+    # Testing guild gets commands first (instant update for dev iteration).
+    # Main guild follows. Global registration is NOT used — guild sync is instant.
+    print("[Startup] 🔄 Registering slash commands to guilds...")
+    all_commands = [cmd.name for cmd in bot.tree.get_commands()]
+    print(f"[Startup] 📋 Commands to register ({len(all_commands)}): {', '.join(sorted(all_commands))}")
+
     for guild_id in (TEST_GUILD_ID, MAIN_GUILD_ID):
+        label = "testing" if guild_id == TEST_GUILD_ID else "main"
         guild_obj = discord.Object(id=guild_id)
+        # Check if bot is actually in this guild before trying to sync.
+        guild_in_cache = bot.get_guild(guild_id)
+        if guild_in_cache is None and guild_id == MAIN_GUILD_ID:
+            print(f"[Startup] ⚠️  Bot is not in main server ({guild_id}) — skipping main guild sync.")
+            continue
         try:
             synced = await bot.tree.sync(guild=guild_obj)
-            synced_count = len(synced)
-            label = "testing" if guild_id == TEST_GUILD_ID else "main"
-            print(f"[Startup] ✅ Synced {synced_count} slash commands to {label} server ({guild_id})")
+            print(f"[Startup] ✅ Registered {len(synced)} slash commands to {label} server ({guild_id})")
+            for cmd in sorted(synced, key=lambda c: c.name):
+                print(f"[Startup]    /{cmd.name}")
+        except discord.errors.Forbidden:
+            print(f"[Startup] ❌ Missing applications.commands scope for {label} server ({guild_id}). "
+                  f"Re-invite the bot with scopes: bot, applications.commands")
         except Exception as exc:
-            print(f"[Startup] ⚠️  Command sync failed for guild {guild_id}: {exc}")
+            print(f"[Startup] ⚠️  Command sync failed for {label} server ({guild_id}): {exc}")
 
     print("=" * 60)
     print("[Startup] ✅ EAS Stock Market Bot is READY")
@@ -1352,66 +1508,6 @@ async def ping(interaction: discord.Interaction):
         f"**Uptime:** {uptime_str}"
     )
     await send_embed(interaction, "🏓 Pong", desc, discord.Color.green())
-
-
-@bot.tree.command(name="marketcommands", description="View EAS stock market commands by page.")
-@app_commands.describe(page="Page number: 1 Economy, 2 Market, 3 Trading, 4 Staff, 5 Developer")
-async def marketcommands(interaction: discord.Interaction, page: int = 1):
-    """Paginated command reference for the EAS Stock Market Bot."""
-    pages = {
-        1: (
-            "📘 Economy Commands",
-            "`/register` — Accept Terms & Conditions and register\n"
-            "`/ping` — Bot status, latency & uptime\n"
-            "`/balance` — View your SP balance & wealth role\n"
-            "`/daily` — Claim your daily $50,000 SP reward\n"
-            "`/marketcommands` — This command list\n\n"
-            "**Starting Balance:** $250,000 SP\n"
-            "**Daily Reward:** $50,000 SP\n\n"
-            "**Note:** All market commands require registration via `/register`",
-        ),
-        2: (
-            "📈 Market Commands",
-            "`/market` — View the Top 10 stock market\n"
-            "`/stock <player>` — View a player's stock details\n"
-            "`/marketleaderboard` — Top investors by net worth\n"
-            "`/shop` — Browse the investor shop\n"
-            "`/portfolio` — View your holdings & P/L\n"
-            "`/transactions` — Your recent trade history",
-        ),
-        3: (
-            "💹 Trading Commands",
-            "`/buy <player> <shares>` — Buy shares of a top 10 player\n"
-            "`/sell <player> <shares>` — Sell shares (3% tax)\n"
-            "`/topstocks` — Highest priced stocks\n"
-            "`/gainers` — Recent biggest gainers\n"
-            "`/losers` — Recent biggest losers",
-        ),
-        4: (
-            "🛡️ Staff Commands",
-            "`/syncmarket` — Sync top 10 from ranked database\n"
-            "`/marketopen` — Open trading\n"
-            "`/marketclose` — Close trading\n"
-            "`/logresult` — Manually log a match result\n"
-            "`/freezeportfolio` — Log a portfolio freeze\n"
-            "`/unfreezeportfolio` — Log a portfolio unfreeze",
-        ),
-        5: (
-            "👑 Developer Commands",
-            "`/givepoints` — Give SP to a user\n"
-            "`/takepoints` — Take SP from a user\n"
-            "`/resetbalance` — Reset a user's balance\n"
-            "`/marketsimulate` — Trigger test-server simulation (test only)\n"
-            "`/marketresettest` — Reset test database (test only)\n"
-            "`/marketstatus` — Show database & mode status\n\n"
-            f"Only developer ID `{DEVELOPER_USER_ID}` can use these.",
-        ),
-    }
-    page = max(1, min(5, page))
-    title, desc = pages[page]
-    embed = discord.Embed(title=title, description=desc, color=discord.Color.gold())
-    embed.set_footer(text=f"Page {page}/5 • Use /marketcommands page:2 for next page")
-    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="register", description="Register for the EAS Stock Market and accept the Terms & Conditions.")
@@ -1864,13 +1960,13 @@ async def shop(interaction: discord.Interaction, page: int = 1):
         await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
         return
     async with pool.acquire() as db:
-        total_items = await db.fetchval("SELECT COUNT(*) FROM market_shop_items;")
+        total_items = await db.fetchval("SELECT COUNT(*) FROM market_shop_items WHERE active=TRUE;")
         items_per_page = 5
         total_pages = max(1, math.ceil(total_items / items_per_page))
         page = max(1, min(page, total_pages))
         offset = (page - 1) * items_per_page
         rows = await db.fetch(
-            "SELECT * FROM market_shop_items ORDER BY price ASC LIMIT $1 OFFSET $2;",
+            "SELECT * FROM market_shop_items WHERE active=TRUE ORDER BY price ASC LIMIT $1 OFFSET $2;",
             items_per_page, offset,
         )
 
@@ -1878,12 +1974,19 @@ async def shop(interaction: discord.Interaction, page: int = 1):
         await send_embed(interaction, "🛒 EAS Investor Shop", "The shop is currently empty.", discord.Color.blue())
         return
 
-    # Group items by category for display.
+    # Display items with ID for /buyitem reference.
     category_icons = {"badge": "🏅", "title": "📛", "cosmetic": "🎨", "trophy": "🏆"}
+    rarity_colors = {"common": "⬜", "uncommon": "🟩", "rare": "🟦", "epic": "🟪",
+                     "legendary": "🟨", "mythic": "🟥", "exclusive": "🔶"}
     desc = ""
     for r in rows:
         icon = category_icons.get(r["category"], "🛍️")
-        desc += f"{icon} **{r['item_name']}** — `{money(r['price'])}`\n"
+        rarity_icon = rarity_colors.get(r["rarity"], "⬜")
+        stock_tag = ""
+        if r["limited"]:
+            stock_left = r["current_stock"] if r["current_stock"] is not None else 0
+            stock_tag = f" | 📦 {stock_left} left" if stock_left > 0 else " | ❌ Sold Out"
+        desc += f"{icon} {rarity_icon} **[ID: {r['id']}] {r['item_name']}** — `{money(r['price'])}`{stock_tag}\n"
         if r["description"]:
             desc += f"  _{r['description']}_\n"
         desc += "\n"
@@ -1893,7 +1996,7 @@ async def shop(interaction: discord.Interaction, page: int = 1):
         description=desc.strip(),
         color=discord.Color.blue(),
     )
-    embed.set_footer(text=f"Page {page}/{total_pages} • Use /shop page:{page+1} for more")
+    embed.set_footer(text=f"Page {page}/{total_pages} • Use /buyitem <ID> to purchase • /shop page:{page+1} for more")
     await interaction.response.send_message(embed=embed)
 
 
@@ -2313,6 +2416,1178 @@ async def marketstatus(interaction: discord.Interaction):
     )
     embed = discord.Embed(title="📊 Market Status", description=desc, color=discord.Color.blurple())
     embed.set_footer(text=f"Guild: {interaction.guild.name if interaction.guild else 'DM'}")
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /marketforceupdate — Developer: force an immediate top-10 sync + simulation
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="marketforceupdate", description="Developer: Force an immediate market update cycle.")
+async def marketforceupdate(interaction: discord.Interaction):
+    """Force an immediate top-10 sync (main) or simulation tick (test)."""
+    if not is_developer(interaction.user):
+        await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    await interaction.response.defer()
+    try:
+        if guild_id == TEST_GUILD_ID:
+            if db_manager.db_pool_test is None:
+                await interaction.followup.send(embed=discord.Embed(title="❌ Test DB Unavailable", color=discord.Color.red()))
+                return
+            results = await simulate_market_movement(db_manager.db_pool_test)
+            desc = f"✅ Simulation tick complete — **{len(results)}** stocks updated."
+        else:
+            count = await sync_top10_for_guild(interaction.guild)
+            desc = f"✅ Top 10 sync complete — **{count}** stocks updated."
+        embed = discord.Embed(title="🔄 Market Force Update", description=desc, color=discord.Color.green())
+        embed.set_footer(text=mode_label(guild_id))
+        await interaction.followup.send(embed=embed)
+    except Exception as exc:
+        await interaction.followup.send(embed=discord.Embed(
+            title="❌ Force Update Error", description=str(exc), color=discord.Color.red()
+        ))
+
+
+# ---------------------------------------------------------------------------
+# /synccommands — Developer: manually re-register all slash commands
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="synccommands", description="Developer: Re-register all slash commands to both guilds.")
+async def synccommands(interaction: discord.Interaction):
+    """Manually re-sync all slash commands to testing and main guilds."""
+    if not is_developer(interaction.user):
+        await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    results: List[str] = []
+    for guild_id in (TEST_GUILD_ID, MAIN_GUILD_ID):
+        label = "testing" if guild_id == TEST_GUILD_ID else "main"
+        guild_obj = discord.Object(id=guild_id)
+        guild_in_cache = bot.get_guild(guild_id)
+        if guild_in_cache is None and guild_id == MAIN_GUILD_ID:
+            results.append(f"⚠️ **{label}** ({guild_id}): Bot not in server — skipped.")
+            continue
+        try:
+            synced = await bot.tree.sync(guild=guild_obj)
+            results.append(f"✅ **{label}** ({guild_id}): {len(synced)} commands registered.")
+        except discord.errors.Forbidden:
+            results.append(f"❌ **{label}** ({guild_id}): Missing `applications.commands` scope.")
+        except Exception as exc:
+            results.append(f"⚠️ **{label}** ({guild_id}): {exc}")
+    desc = "\n".join(results)
+    embed = discord.Embed(title="🔄 Slash Command Sync", description=desc, color=discord.Color.blurple())
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /starpoints — View your StarPoints balance (alias for /balance)
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="starpoints", description="View your StarPoints balance and wealth role.")
+async def starpoints(interaction: discord.Interaction):
+    """Alias for /balance — shows SP balance and wealth role."""
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
+    await ensure_user(guild_id, interaction.user.id, pool)
+    async with pool.acquire() as db:
+        row = await db.fetchrow(
+            "SELECT balance, wealth_role FROM market_users WHERE guild_id=$1 AND user_id=$2;",
+            guild_id, interaction.user.id,
+        )
+    bal = int(row["balance"])
+    role = row["wealth_role"] or "None"
+    next_role: Optional[str] = None
+    next_threshold: Optional[int] = None
+    for role_name, threshold in reversed(WEALTH_ROLES):
+        if bal < threshold:
+            next_role = role_name
+            next_threshold = threshold
+    desc = f"**Balance:** {money(bal)}\n**Wealth Role:** {role}\n"
+    if next_role and next_threshold:
+        needed = next_threshold - bal
+        desc += f"**Next Role:** {next_role} (need {money(needed)} more)"
+    else:
+        desc += "**Status:** 🏆 Maximum wealth role achieved!"
+    embed = discord.Embed(title="⭐ StarPoints Balance", description=desc, color=discord.Color.gold())
+    embed.set_footer(text=f"Guild: {interaction.guild.name} • {mode_label(guild_id)}")
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /starpointprice — View current StarPoint exchange rate info
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="starpointprice", description="View StarPoint economy info and exchange rates.")
+async def starpointprice(interaction: discord.Interaction):
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    desc = (
+        f"**Starting Balance:** {money(STARTING_SP)}\n"
+        f"**Daily Reward:** {money(DAILY_SP)}\n"
+        f"**Sell Tax:** {int(SELL_TAX * 100)}%\n"
+        f"**Max Ownership:** {int(MAX_OWNERSHIP_PERCENT * 100)}% per stock\n\n"
+        "**Wealth Role Thresholds:**\n"
+    )
+    for role_name, threshold in WEALTH_ROLES:
+        desc += f"• **{role_name}** — {money(threshold)}\n"
+    embed = discord.Embed(title="💱 StarPoint Economy Info", description=desc, color=discord.Color.gold())
+    embed.set_footer(text=mode_label(interaction.guild.id if interaction.guild else 0))
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /buystarpoints — Placeholder (future feature)
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="buystarpoints", description="Buy StarPoints (coming soon).")
+async def buystarpoints(interaction: discord.Interaction):
+    await send_embed(
+        interaction,
+        "🚧 Coming Soon",
+        "The ability to purchase StarPoints will be available in a future update.\n\n"
+        "For now, earn SP through:\n"
+        "• `/daily` — Claim your daily reward\n"
+        "• Selling stocks at a profit",
+        discord.Color.orange(),
+        True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /sellstarpoints — Placeholder (future feature)
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="sellstarpoints", description="Sell StarPoints (coming soon).")
+async def sellstarpoints(interaction: discord.Interaction):
+    await send_embed(
+        interaction,
+        "🚧 Coming Soon",
+        "The ability to sell StarPoints will be available in a future update.",
+        discord.Color.orange(),
+        True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /inventory — View your purchased shop items
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="inventory", description="View your purchased shop items.")
+async def inventory(interaction: discord.Interaction):
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
+    async with pool.acquire() as db:
+        rows = await db.fetch("""
+        SELECT ui.purchased_at, si.item_name, si.description, si.category, si.rarity
+        FROM market_user_items ui
+        JOIN market_shop_items si ON ui.item_id = si.id
+        WHERE ui.guild_id=$1 AND ui.user_id=$2
+        ORDER BY ui.purchased_at DESC;
+        """, guild_id, interaction.user.id)
+    if not rows:
+        await send_embed(
+            interaction, "🎒 Inventory",
+            "You have no items yet.\nVisit the `/shop` to browse available items!",
+            discord.Color.blue(),
+        )
+        return
+    category_icons = {"badge": "🏅", "title": "📛", "cosmetic": "🎨", "trophy": "🏆"}
+    rarity_colors = {"common": "⬜", "uncommon": "🟩", "rare": "🟦", "epic": "🟪", "legendary": "🟨", "mythic": "🟥", "exclusive": "🔶"}
+    desc = ""
+    for r in rows:
+        icon = category_icons.get(r["category"], "🛍️")
+        rarity_icon = rarity_colors.get(r["rarity"], "⬜")
+        date_str = r["purchased_at"].strftime("%Y-%m-%d") if r["purchased_at"] else "Unknown"
+        desc += f"{icon} {rarity_icon} **{r['item_name']}** _{r['rarity']}_\n"
+        if r["description"]:
+            desc += f"  _{r['description']}_\n"
+        desc += f"  Purchased: {date_str}\n\n"
+    embed = discord.Embed(
+        title=f"🎒 {interaction.user.display_name}'s Inventory",
+        description=desc[:3900],
+        color=discord.Color.blue(),
+    )
+    embed.set_footer(text=f"{len(rows)} item(s) • {mode_label(guild_id)}")
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /buyitem — Purchase an item from the shop
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="buyitem", description="Purchase an item from the EAS shop.")
+@app_commands.describe(item_id="The ID number of the item to purchase (from /shop)")
+async def buyitem(interaction: discord.Interaction, item_id: int):
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
+    async with pool.acquire() as db:
+        item = await db.fetchrow(
+            "SELECT * FROM market_shop_items WHERE id=$1 AND active=TRUE;", item_id
+        )
+        if not item:
+            await send_embed(interaction, "❌ Item Not Found",
+                             f"No active shop item with ID `{item_id}`. Use `/shop` to browse.", discord.Color.red(), True)
+            return
+        # Check stock for limited items.
+        if item["limited"] and item["current_stock"] is not None and item["current_stock"] <= 0:
+            await send_embed(interaction, "❌ Out of Stock",
+                             f"**{item['item_name']}** is sold out.", discord.Color.red(), True)
+            return
+        # Check if already owned.
+        already_owned = await db.fetchval(
+            "SELECT id FROM market_user_items WHERE guild_id=$1 AND user_id=$2 AND item_id=$3;",
+            guild_id, interaction.user.id, item_id,
+        )
+        if already_owned:
+            await send_embed(interaction, "❌ Already Owned",
+                             f"You already own **{item['item_name']}**.", discord.Color.orange(), True)
+            return
+        # Check balance.
+        bal = await db.fetchval(
+            "SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;",
+            guild_id, interaction.user.id,
+        )
+        if bal is None or bal < item["price"]:
+            await send_embed(interaction, "❌ Insufficient Funds",
+                             f"**{item['item_name']}** costs **{money(item['price'])}** but you have **{money(bal or 0)}**.",
+                             discord.Color.red(), True)
+            return
+        # Deduct balance and record purchase.
+        await db.execute(
+            "UPDATE market_users SET balance=balance-$1 WHERE guild_id=$2 AND user_id=$3;",
+            item["price"], guild_id, interaction.user.id,
+        )
+        await db.execute(
+            "INSERT INTO market_user_items (guild_id, user_id, item_id) VALUES ($1,$2,$3);",
+            guild_id, interaction.user.id, item_id,
+        )
+        await db.execute(
+            "INSERT INTO market_transactions (guild_id,investor_id,type,total) VALUES ($1,$2,'shop_purchase',$3);",
+            guild_id, interaction.user.id, item["price"],
+        )
+        # Decrement stock for limited items.
+        if item["limited"] and item["current_stock"] is not None:
+            await db.execute(
+                "UPDATE market_shop_items SET current_stock=current_stock-1 WHERE id=$1;", item_id
+            )
+        new_bal = await db.fetchval(
+            "SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;",
+            guild_id, interaction.user.id,
+        )
+    await update_wealth_role(guild_id, interaction.user.id, int(new_bal), pool)
+    category_icons = {"badge": "🏅", "title": "📛", "cosmetic": "🎨", "trophy": "🏆"}
+    icon = category_icons.get(item["category"], "🛍️")
+    desc = (
+        f"{icon} **{item['item_name']}** purchased!\n\n"
+        f"**Price Paid:** {money(item['price'])}\n"
+        f"**New Balance:** {money(int(new_bal))}\n\n"
+        f"_{item['description'] or 'No description.'}_"
+    )
+    embed = discord.Embed(title="✅ Item Purchased", description=desc, color=discord.Color.green())
+    embed.set_footer(text=mode_label(guild_id))
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /resellitem — Resell an owned item back to the shop
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="resellitem", description="Resell an owned item back to the shop for a partial refund.")
+@app_commands.describe(item_id="The ID number of the item to resell (from /inventory)")
+async def resellitem(interaction: discord.Interaction, item_id: int):
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
+    async with pool.acquire() as db:
+        owned = await db.fetchrow(
+            "SELECT ui.id as own_id FROM market_user_items ui WHERE ui.guild_id=$1 AND ui.user_id=$2 AND ui.item_id=$3;",
+            guild_id, interaction.user.id, item_id,
+        )
+        if not owned:
+            await send_embed(interaction, "❌ Not Owned",
+                             f"You don't own item ID `{item_id}`. Use `/inventory` to see your items.", discord.Color.red(), True)
+            return
+        item = await db.fetchrow("SELECT * FROM market_shop_items WHERE id=$1;", item_id)
+        if not item:
+            await send_embed(interaction, "❌ Item Not Found", "Item data not found.", discord.Color.red(), True)
+            return
+        resale_pct = item["resale_percent"] if item["resale_percent"] is not None else 70
+        refund = math.floor(item["price"] * resale_pct / 100)
+        # Remove from inventory and refund.
+        await db.execute(
+            "DELETE FROM market_user_items WHERE id=$1;", owned["own_id"]
+        )
+        await db.execute(
+            "UPDATE market_users SET balance=balance+$1 WHERE guild_id=$2 AND user_id=$3;",
+            refund, guild_id, interaction.user.id,
+        )
+        await db.execute(
+            "INSERT INTO market_transactions (guild_id,investor_id,type,total) VALUES ($1,$2,'shop_resell',$3);",
+            guild_id, interaction.user.id, refund,
+        )
+        # Restock limited items.
+        if item["limited"] and item["current_stock"] is not None:
+            await db.execute(
+                "UPDATE market_shop_items SET current_stock=current_stock+1 WHERE id=$1;", item_id
+            )
+        new_bal = await db.fetchval(
+            "SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;",
+            guild_id, interaction.user.id,
+        )
+    await update_wealth_role(guild_id, interaction.user.id, int(new_bal), pool)
+    desc = (
+        f"**{item['item_name']}** has been resold.\n\n"
+        f"**Refund ({resale_pct}%):** {money(refund)}\n"
+        f"**New Balance:** {money(int(new_bal))}"
+    )
+    embed = discord.Embed(title="💰 Item Resold", description=desc, color=discord.Color.green())
+    embed.set_footer(text=mode_label(guild_id))
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /shopadmin — Admin command group for shop management
+# ---------------------------------------------------------------------------
+
+# Helper: log a shop audit entry.
+async def _shop_audit(pool: asyncpg.Pool, item_id: Optional[int], item_name: Optional[str],
+                      action: str, changed_by: int, field: Optional[str] = None,
+                      old_value: Optional[str] = None, new_value: Optional[str] = None,
+                      note: Optional[str] = None) -> None:
+    try:
+        async with pool.acquire() as db:
+            await db.execute("""
+            INSERT INTO market_shop_audit (item_id, item_name, action, changed_by, field, old_value, new_value, note)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+            """, item_id, item_name, action, changed_by, field, old_value, new_value, note)
+    except Exception as exc:
+        print(f"[ShopAudit] ⚠️  Failed to log audit: {exc}")
+
+
+def _is_shop_admin(interaction: discord.Interaction) -> bool:
+    """Return True if the user is the developer or a staff member."""
+    return is_developer(interaction.user) or is_staff(interaction.user)
+
+
+shopadmin_group = app_commands.Group(
+    name="shopadmin",
+    description="Shop administration commands (staff/developer only).",
+)
+
+
+@shopadmin_group.command(name="list", description="List all shop items with details.")
+async def shopadmin_list(interaction: discord.Interaction):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        rows = await db.fetch(
+            "SELECT * FROM market_shop_items ORDER BY id ASC LIMIT 25;"
+        )
+    if not rows:
+        await send_embed(interaction, "🛒 Shop Items", "No items in the shop.", discord.Color.blue(), True)
+        return
+    desc = ""
+    for r in rows:
+        status = "✅" if r["active"] else "❌"
+        limited_tag = f" | 📦 {r['current_stock']}/{r['max_stock']}" if r["limited"] else ""
+        badge_tag = f" | 🏅 `{r['badge_id']}`" if r["badge_id"] else ""
+        role_tag = f" | 👥 <@&{r['role_id']}>" if r["role_id"] else ""
+        desc += (
+            f"{status} **[{r['id']}] {r['item_name']}** — `{money(r['price'])}` | "
+            f"_{r['rarity']}_ | {r['category']}{limited_tag}{badge_tag}{role_tag}\n"
+        )
+    embed = discord.Embed(title="🛒 Shop Admin — Item List", description=desc[:3900], color=discord.Color.blue())
+    embed.set_footer(text=f"{len(rows)} items shown (max 25)")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@shopadmin_group.command(name="create", description="Create a new shop item.")
+@app_commands.describe(
+    name="Item name",
+    description="Item description",
+    price="Price in StarPoints",
+    category="Category: badge, title, cosmetic, trophy",
+    rarity="Rarity: common, uncommon, rare, epic, legendary, mythic, exclusive",
+    limited="Is this a limited stock item?",
+    max_stock="Maximum stock (for limited items)",
+    badge_id="Badge ID to award (from badge_manifest.json)",
+    role_id="Discord role ID to award",
+)
+async def shopadmin_create(
+    interaction: discord.Interaction,
+    name: str,
+    price: int,
+    category: str,
+    description: str = "",
+    rarity: str = "common",
+    limited: bool = False,
+    max_stock: Optional[int] = None,
+    badge_id: Optional[str] = None,
+    role_id: Optional[str] = None,
+):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    valid_categories = {"badge", "title", "cosmetic", "trophy"}
+    valid_rarities = {"common", "uncommon", "rare", "epic", "legendary", "mythic", "exclusive"}
+    if category not in valid_categories:
+        await send_embed(interaction, "❌ Invalid Category",
+                         f"Category must be one of: {', '.join(valid_categories)}", discord.Color.red(), True)
+        return
+    if rarity not in valid_rarities:
+        await send_embed(interaction, "❌ Invalid Rarity",
+                         f"Rarity must be one of: {', '.join(valid_rarities)}", discord.Color.red(), True)
+        return
+    role_id_int: Optional[int] = None
+    if role_id:
+        try:
+            role_id_int = int(role_id)
+        except ValueError:
+            await send_embed(interaction, "❌ Invalid Role ID", "Role ID must be a number.", discord.Color.red(), True)
+            return
+    current_stock = max_stock if limited and max_stock else None
+    try:
+        async with pool.acquire() as db:
+            new_id = await db.fetchval("""
+            INSERT INTO market_shop_items
+                (item_name, description, price, category, rarity, active, limited, max_stock, current_stock, badge_id, role_id)
+            VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10)
+            RETURNING id;
+            """, name, description, price, category, rarity, limited, max_stock, current_stock, badge_id, role_id_int)
+    except Exception as exc:
+        await send_embed(interaction, "❌ Create Failed", str(exc), discord.Color.red(), True)
+        return
+    await _shop_audit(pool, new_id, name, "create", interaction.user.id,
+                      note=f"price={price}, category={category}, rarity={rarity}, limited={limited}")
+    desc = (
+        f"**ID:** `{new_id}`\n"
+        f"**Name:** {name}\n"
+        f"**Price:** {money(price)}\n"
+        f"**Category:** {category}\n"
+        f"**Rarity:** {rarity}\n"
+        f"**Limited:** {'Yes' if limited else 'No'}"
+    )
+    if limited and max_stock:
+        desc += f"\n**Max Stock:** {max_stock}"
+    if badge_id:
+        desc += f"\n**Badge ID:** `{badge_id}`"
+    if role_id_int:
+        desc += f"\n**Role:** <@&{role_id_int}>"
+    embed = discord.Embed(title="✅ Shop Item Created", description=desc, color=discord.Color.green())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@shopadmin_group.command(name="edit", description="Edit an existing shop item's details.")
+@app_commands.describe(
+    item_id="Item ID to edit",
+    name="New name",
+    description="New description",
+    rarity="New rarity",
+    badge_id="New badge ID",
+    role_id="New role ID",
+)
+async def shopadmin_edit(
+    interaction: discord.Interaction,
+    item_id: int,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    rarity: Optional[str] = None,
+    badge_id: Optional[str] = None,
+    role_id: Optional[str] = None,
+):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        item = await db.fetchrow("SELECT * FROM market_shop_items WHERE id=$1;", item_id)
+    if not item:
+        await send_embed(interaction, "❌ Not Found", f"No item with ID `{item_id}`.", discord.Color.red(), True)
+        return
+    valid_rarities = {"common", "uncommon", "rare", "epic", "legendary", "mythic", "exclusive"}
+    if rarity and rarity not in valid_rarities:
+        await send_embed(interaction, "❌ Invalid Rarity",
+                         f"Rarity must be one of: {', '.join(valid_rarities)}", discord.Color.red(), True)
+        return
+    role_id_int: Optional[int] = None
+    if role_id:
+        try:
+            role_id_int = int(role_id)
+        except ValueError:
+            await send_embed(interaction, "❌ Invalid Role ID", "Role ID must be a number.", discord.Color.red(), True)
+            return
+    changes: List[str] = []
+    async with pool.acquire() as db:
+        if name and name != item["item_name"]:
+            await db.execute("UPDATE market_shop_items SET item_name=$1, updated_at=NOW() WHERE id=$2;", name, item_id)
+            await _shop_audit(pool, item_id, name, "edit", interaction.user.id, "item_name", item["item_name"], name)
+            changes.append(f"Name: `{item['item_name']}` → `{name}`")
+        if description is not None and description != item["description"]:
+            await db.execute("UPDATE market_shop_items SET description=$1, updated_at=NOW() WHERE id=$2;", description, item_id)
+            await _shop_audit(pool, item_id, item["item_name"], "edit", interaction.user.id, "description", item["description"], description)
+            changes.append("Description updated.")
+        if rarity and rarity != item["rarity"]:
+            await db.execute("UPDATE market_shop_items SET rarity=$1, updated_at=NOW() WHERE id=$2;", rarity, item_id)
+            await _shop_audit(pool, item_id, item["item_name"], "edit", interaction.user.id, "rarity", item["rarity"], rarity)
+            changes.append(f"Rarity: `{item['rarity']}` → `{rarity}`")
+        if badge_id is not None and badge_id != item["badge_id"]:
+            await db.execute("UPDATE market_shop_items SET badge_id=$1, updated_at=NOW() WHERE id=$2;", badge_id or None, item_id)
+            await _shop_audit(pool, item_id, item["item_name"], "edit", interaction.user.id, "badge_id", item["badge_id"], badge_id)
+            changes.append(f"Badge ID: `{item['badge_id']}` → `{badge_id}`")
+        if role_id is not None and role_id_int != item["role_id"]:
+            await db.execute("UPDATE market_shop_items SET role_id=$1, updated_at=NOW() WHERE id=$2;", role_id_int, item_id)
+            await _shop_audit(pool, item_id, item["item_name"], "edit", interaction.user.id, "role_id", str(item["role_id"]), str(role_id_int))
+            changes.append(f"Role ID: `{item['role_id']}` → `{role_id_int}`")
+    if not changes:
+        await send_embed(interaction, "ℹ️ No Changes", "No fields were changed.", discord.Color.orange(), True)
+        return
+    desc = f"**Item [{item_id}] {item['item_name']}** updated:\n\n" + "\n".join(f"• {c}" for c in changes)
+    embed = discord.Embed(title="✅ Item Edited", description=desc, color=discord.Color.green())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@shopadmin_group.command(name="stock", description="View current stock and max stock for an item.")
+@app_commands.describe(item_id="Item ID to check")
+async def shopadmin_stock(interaction: discord.Interaction, item_id: int):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        item = await db.fetchrow("SELECT * FROM market_shop_items WHERE id=$1;", item_id)
+    if not item:
+        await send_embed(interaction, "❌ Not Found", f"No item with ID `{item_id}`.", discord.Color.red(), True)
+        return
+    if not item["limited"]:
+        desc = f"**{item['item_name']}** is **unlimited** — no stock tracking."
+    else:
+        current = item["current_stock"] if item["current_stock"] is not None else "N/A"
+        max_s = item["max_stock"] if item["max_stock"] is not None else "N/A"
+        desc = (
+            f"**Item:** {item['item_name']}\n"
+            f"**Current Stock:** {current}\n"
+            f"**Max Stock:** {max_s}\n"
+            f"**Status:** {'✅ In Stock' if (item['current_stock'] or 0) > 0 else '❌ Out of Stock'}"
+        )
+    embed = discord.Embed(title=f"📦 Stock — [{item_id}] {item['item_name']}", description=desc, color=discord.Color.blue())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@shopadmin_group.command(name="restock", description="Set max stock and current stock for a limited item.")
+@app_commands.describe(item_id="Item ID to restock", max_stock="New max stock", current_stock="New current stock")
+async def shopadmin_restock(interaction: discord.Interaction, item_id: int, max_stock: int, current_stock: int):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        item = await db.fetchrow("SELECT * FROM market_shop_items WHERE id=$1;", item_id)
+        if not item:
+            await send_embed(interaction, "❌ Not Found", f"No item with ID `{item_id}`.", discord.Color.red(), True)
+            return
+        await db.execute(
+            "UPDATE market_shop_items SET limited=TRUE, max_stock=$1, current_stock=$2, updated_at=NOW() WHERE id=$3;",
+            max_stock, current_stock, item_id,
+        )
+    await _shop_audit(pool, item_id, item["item_name"], "restock", interaction.user.id,
+                      note=f"max_stock={max_stock}, current_stock={current_stock}")
+    desc = (
+        f"**{item['item_name']}** restocked:\n"
+        f"**Max Stock:** {max_stock}\n"
+        f"**Current Stock:** {current_stock}"
+    )
+    embed = discord.Embed(title="✅ Item Restocked", description=desc, color=discord.Color.green())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@shopadmin_group.command(name="price", description="Update item price, min value, and max value.")
+@app_commands.describe(
+    item_id="Item ID to update",
+    price="New current price",
+    min_value="New minimum value",
+    max_value="New maximum value",
+)
+async def shopadmin_price(
+    interaction: discord.Interaction,
+    item_id: int,
+    price: Optional[int] = None,
+    min_value: Optional[int] = None,
+    max_value: Optional[int] = None,
+):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        item = await db.fetchrow("SELECT * FROM market_shop_items WHERE id=$1;", item_id)
+        if not item:
+            await send_embed(interaction, "❌ Not Found", f"No item with ID `{item_id}`.", discord.Color.red(), True)
+            return
+        changes: List[str] = []
+        if price is not None and price != item["price"]:
+            old_price = item["price"]
+            await db.execute("UPDATE market_shop_items SET price=$1, updated_at=NOW() WHERE id=$2;", price, item_id)
+            await db.execute("""
+            INSERT INTO market_item_value_history (item_id, old_price, new_price, changed_by, reason)
+            VALUES ($1,$2,$3,$4,'admin price update');
+            """, item_id, old_price, price, interaction.user.id)
+            await _shop_audit(pool, item_id, item["item_name"], "price_change", interaction.user.id,
+                              "price", str(old_price), str(price))
+            changes.append(f"Price: `{money(old_price)}` → `{money(price)}`")
+        if min_value is not None and min_value != item["min_value"]:
+            await db.execute("UPDATE market_shop_items SET min_value=$1, updated_at=NOW() WHERE id=$2;", min_value, item_id)
+            await _shop_audit(pool, item_id, item["item_name"], "edit", interaction.user.id,
+                              "min_value", str(item["min_value"]), str(min_value))
+            changes.append(f"Min Value: `{money(min_value)}`")
+        if max_value is not None and max_value != item["max_value"]:
+            await db.execute("UPDATE market_shop_items SET max_value=$1, updated_at=NOW() WHERE id=$2;", max_value, item_id)
+            await _shop_audit(pool, item_id, item["item_name"], "edit", interaction.user.id,
+                              "max_value", str(item["max_value"]), str(max_value))
+            changes.append(f"Max Value: `{money(max_value)}`")
+    if not changes:
+        await send_embed(interaction, "ℹ️ No Changes", "No price fields were changed.", discord.Color.orange(), True)
+        return
+    desc = f"**Item [{item_id}] {item['item_name']}** price updated:\n\n" + "\n".join(f"• {c}" for c in changes)
+    embed = discord.Embed(title="✅ Price Updated", description=desc, color=discord.Color.green())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@shopadmin_group.command(name="resale", description="Set the resale percentage for an item.")
+@app_commands.describe(item_id="Item ID", percent="Resale percent (0–100)")
+async def shopadmin_resale(interaction: discord.Interaction, item_id: int, percent: int):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    if not 0 <= percent <= 100:
+        await send_embed(interaction, "❌ Invalid Percent", "Resale percent must be between 0 and 100.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        item = await db.fetchrow("SELECT * FROM market_shop_items WHERE id=$1;", item_id)
+        if not item:
+            await send_embed(interaction, "❌ Not Found", f"No item with ID `{item_id}`.", discord.Color.red(), True)
+            return
+        old_pct = item["resale_percent"]
+        await db.execute("UPDATE market_shop_items SET resale_percent=$1, updated_at=NOW() WHERE id=$2;", percent, item_id)
+    await _shop_audit(pool, item_id, item["item_name"], "edit", interaction.user.id,
+                      "resale_percent", str(old_pct), str(percent))
+    desc = f"**{item['item_name']}** resale percent: `{old_pct}%` → `{percent}%`"
+    embed = discord.Embed(title="✅ Resale Percent Updated", description=desc, color=discord.Color.green())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@shopadmin_group.command(name="enable", description="Enable a disabled shop item.")
+@app_commands.describe(item_id="Item ID to enable")
+async def shopadmin_enable(interaction: discord.Interaction, item_id: int):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        item = await db.fetchrow("SELECT * FROM market_shop_items WHERE id=$1;", item_id)
+        if not item:
+            await send_embed(interaction, "❌ Not Found", f"No item with ID `{item_id}`.", discord.Color.red(), True)
+            return
+        if item["active"]:
+            await send_embed(interaction, "ℹ️ Already Active", f"**{item['item_name']}** is already enabled.", discord.Color.orange(), True)
+            return
+        await db.execute("UPDATE market_shop_items SET active=TRUE, updated_at=NOW() WHERE id=$1;", item_id)
+    await _shop_audit(pool, item_id, item["item_name"], "enable", interaction.user.id)
+    embed = discord.Embed(
+        title="✅ Item Enabled",
+        description=f"**{item['item_name']}** is now active and visible in the shop.",
+        color=discord.Color.green(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class ConfirmDisableView(discord.ui.View):
+    """Confirmation view for disabling a shop item."""
+
+    def __init__(self, item_id: int, item_name: str, pool: asyncpg.Pool, admin_id: int):
+        super().__init__(timeout=60)
+        self.item_id = item_id
+        self.item_name = item_name
+        self.pool = pool
+        self.admin_id = admin_id
+        self.confirmed = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("Not your confirmation.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="✅ Confirm Disable", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(view=self)
+        async with self.pool.acquire() as db:
+            await db.execute("UPDATE market_shop_items SET active=FALSE, updated_at=NOW() WHERE id=$1;", self.item_id)
+        await _shop_audit(self.pool, self.item_id, self.item_name, "disable", self.admin_id)
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="✅ Item Disabled",
+                description=f"**{self.item_name}** has been disabled and hidden from the shop.",
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        self.stop()
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send("Disable cancelled.", ephemeral=True)
+        self.stop()
+
+
+@shopadmin_group.command(name="disable", description="Disable a shop item (hides it from the shop).")
+@app_commands.describe(item_id="Item ID to disable")
+async def shopadmin_disable(interaction: discord.Interaction, item_id: int):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        item = await db.fetchrow("SELECT * FROM market_shop_items WHERE id=$1;", item_id)
+    if not item:
+        await send_embed(interaction, "❌ Not Found", f"No item with ID `{item_id}`.", discord.Color.red(), True)
+        return
+    if not item["active"]:
+        await send_embed(interaction, "ℹ️ Already Disabled", f"**{item['item_name']}** is already disabled.", discord.Color.orange(), True)
+        return
+    view = ConfirmDisableView(item_id, item["item_name"], pool, interaction.user.id)
+    embed = discord.Embed(
+        title="⚠️ Confirm Disable",
+        description=f"Are you sure you want to disable **{item['item_name']}**?\nIt will be hidden from the shop.",
+        color=discord.Color.orange(),
+    )
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class ConfirmDeleteView(discord.ui.View):
+    """Confirmation view for deleting a shop item."""
+
+    def __init__(self, item_id: int, item_name: str, pool: asyncpg.Pool, admin_id: int):
+        super().__init__(timeout=60)
+        self.item_id = item_id
+        self.item_name = item_name
+        self.pool = pool
+        self.admin_id = admin_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("Not your confirmation.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="🗑️ Confirm Delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(view=self)
+        async with self.pool.acquire() as db:
+            await db.execute("DELETE FROM market_shop_items WHERE id=$1;", self.item_id)
+        await _shop_audit(self.pool, self.item_id, self.item_name, "delete", self.admin_id)
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="🗑️ Item Deleted",
+                description=f"**{self.item_name}** has been permanently deleted from the shop.",
+                color=discord.Color.red(),
+            ),
+            ephemeral=True,
+        )
+        self.stop()
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send("Delete cancelled.", ephemeral=True)
+        self.stop()
+
+
+@shopadmin_group.command(name="delete", description="Permanently delete a shop item.")
+@app_commands.describe(item_id="Item ID to delete")
+async def shopadmin_delete(interaction: discord.Interaction, item_id: int):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        item = await db.fetchrow("SELECT * FROM market_shop_items WHERE id=$1;", item_id)
+    if not item:
+        await send_embed(interaction, "❌ Not Found", f"No item with ID `{item_id}`.", discord.Color.red(), True)
+        return
+    view = ConfirmDeleteView(item_id, item["item_name"], pool, interaction.user.id)
+    embed = discord.Embed(
+        title="⚠️ Confirm Delete",
+        description=(
+            f"Are you sure you want to **permanently delete** **{item['item_name']}**?\n\n"
+            "⚠️ This cannot be undone. Users who own this item will keep it in their inventory."
+        ),
+        color=discord.Color.red(),
+    )
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@shopadmin_group.command(name="history", description="View value history and audit log for a shop item.")
+@app_commands.describe(item_id="Item ID to view history for")
+async def shopadmin_history(interaction: discord.Interaction, item_id: int):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        item = await db.fetchrow("SELECT * FROM market_shop_items WHERE id=$1;", item_id)
+        if not item:
+            await send_embed(interaction, "❌ Not Found", f"No item with ID `{item_id}`.", discord.Color.red(), True)
+            return
+        price_hist = await db.fetch("""
+        SELECT old_price, new_price, changed_by, reason, created_at
+        FROM market_item_value_history WHERE item_id=$1
+        ORDER BY created_at DESC LIMIT 10;
+        """, item_id)
+        audit_hist = await db.fetch("""
+        SELECT action, field, old_value, new_value, changed_by, note, created_at
+        FROM market_shop_audit WHERE item_id=$1
+        ORDER BY created_at DESC LIMIT 10;
+        """, item_id)
+    embed = discord.Embed(
+        title=f"📜 History — [{item_id}] {item['item_name']}",
+        color=discord.Color.blurple(),
+    )
+    # Price history.
+    if price_hist:
+        ph_lines = []
+        for r in price_hist:
+            diff = r["new_price"] - r["old_price"]
+            sign = "+" if diff >= 0 else ""
+            date_str = r["created_at"].strftime("%m/%d %H:%M") if r["created_at"] else "?"
+            ph_lines.append(f"`{date_str}` `{sign}{diff:,} SP` → `{money(r['new_price'])}` by <@{r['changed_by']}>")
+        embed.add_field(name="💰 Price History", value="\n".join(ph_lines)[:1024], inline=False)
+    else:
+        embed.add_field(name="💰 Price History", value="No price changes recorded.", inline=False)
+    # Audit log.
+    if audit_hist:
+        al_lines = []
+        for r in audit_hist:
+            date_str = r["created_at"].strftime("%m/%d %H:%M") if r["created_at"] else "?"
+            field_info = f" `{r['field']}`" if r["field"] else ""
+            note_info = f" — {r['note']}" if r["note"] else ""
+            al_lines.append(f"`{date_str}` **{r['action']}**{field_info} by <@{r['changed_by']}>{note_info}")
+        embed.add_field(name="📋 Audit Log", value="\n".join(al_lines)[:1024], inline=False)
+    else:
+        embed.add_field(name="📋 Audit Log", value="No audit entries.", inline=False)
+    embed.set_footer(text=f"Current price: {money(item['price'])} | Rarity: {item['rarity']}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# Register the shopadmin group with the bot's command tree.
+bot.tree.add_command(shopadmin_group)
+
+
+# ---------------------------------------------------------------------------
+# Badge admin helpers — /badgeadmin (developer only)
+# ---------------------------------------------------------------------------
+
+badgeadmin_group = app_commands.Group(
+    name="badgeadmin",
+    description="Badge administration commands (developer only).",
+)
+
+
+@badgeadmin_group.command(name="award", description="Award a badge to a user.")
+@app_commands.describe(user="User to award the badge to", badge_id="Badge ID from badge_manifest.json")
+async def badgeadmin_award(interaction: discord.Interaction, user: discord.Member, badge_id: str):
+    if not is_developer(interaction.user):
+        await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    async with pool.acquire() as db:
+        badge = await db.fetchrow("SELECT * FROM badge_definitions WHERE id=$1;", badge_id)
+        if not badge:
+            await send_embed(interaction, "❌ Badge Not Found",
+                             f"No badge with ID `{badge_id}`. Check badge_manifest.json.", discord.Color.red(), True)
+            return
+        try:
+            await db.execute("""
+            INSERT INTO player_badges (guild_id, user_id, badge_id, awarded_by, source)
+            VALUES ($1,$2,$3,$4,'admin')
+            ON CONFLICT (guild_id, user_id, badge_id) DO NOTHING;
+            """, guild_id, user.id, badge_id, interaction.user.id)
+        except Exception as exc:
+            await send_embed(interaction, "❌ Award Failed", str(exc), discord.Color.red(), True)
+            return
+    desc = (
+        f"**Badge:** {badge['name']} (`{badge_id}`)\n"
+        f"**Awarded to:** {user.mention}\n"
+        f"**Rarity:** {badge['rarity']}\n"
+        f"**Category:** {badge['category']}"
+    )
+    embed = discord.Embed(title="🏅 Badge Awarded", description=desc, color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed)
+
+
+@badgeadmin_group.command(name="revoke", description="Revoke a badge from a user.")
+@app_commands.describe(user="User to revoke the badge from", badge_id="Badge ID to revoke")
+async def badgeadmin_revoke(interaction: discord.Interaction, user: discord.Member, badge_id: str):
+    if not is_developer(interaction.user):
+        await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    async with pool.acquire() as db:
+        result = await db.execute(
+            "DELETE FROM player_badges WHERE guild_id=$1 AND user_id=$2 AND badge_id=$3;",
+            guild_id, user.id, badge_id,
+        )
+    if result == "DELETE 0":
+        await send_embed(interaction, "ℹ️ Not Found",
+                         f"{user.mention} does not have badge `{badge_id}`.", discord.Color.orange(), True)
+        return
+    embed = discord.Embed(
+        title="🗑️ Badge Revoked",
+        description=f"Badge `{badge_id}` revoked from {user.mention}.",
+        color=discord.Color.orange(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@badgeadmin_group.command(name="list", description="List all badges a user has.")
+@app_commands.describe(user="User to check badges for")
+async def badgeadmin_list(interaction: discord.Interaction, user: discord.Member):
+    if not _is_shop_admin(interaction):
+        await send_embed(interaction, "❌ No Permission", "Staff or developer only.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    async with pool.acquire() as db:
+        rows = await db.fetch("""
+        SELECT pb.badge_id, pb.awarded_at, pb.source, bd.name, bd.rarity, bd.category
+        FROM player_badges pb
+        JOIN badge_definitions bd ON pb.badge_id = bd.id
+        WHERE pb.guild_id=$1 AND pb.user_id=$2
+        ORDER BY pb.awarded_at DESC;
+        """, guild_id, user.id)
+    if not rows:
+        await send_embed(interaction, "🏅 Badges", f"{user.mention} has no badges.", discord.Color.blue(), True)
+        return
+    rarity_icons = {"common": "⬜", "uncommon": "🟩", "rare": "🟦", "epic": "🟪",
+                    "legendary": "🟨", "mythic": "🟥", "exclusive": "🔶"}
+    desc = ""
+    for r in rows:
+        icon = rarity_icons.get(r["rarity"], "⬜")
+        date_str = r["awarded_at"].strftime("%Y-%m-%d") if r["awarded_at"] else "?"
+        desc += f"{icon} **{r['name']}** (`{r['badge_id']}`) — _{r['rarity']}_ | {r['source']} | {date_str}\n"
+    embed = discord.Embed(
+        title=f"🏅 {user.display_name}'s Badges ({len(rows)})",
+        description=desc[:3900],
+        color=discord.Color.gold(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@badgeadmin_group.command(name="cleanup", description="Developer: Remove legacy badges not in badge_definitions.")
+@app_commands.describe(user="Specific user to clean up (leave empty for all users)")
+async def badgeadmin_cleanup(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    """Remove legacy/invalid badge entries from player_badges.
+
+    For user saku (1257212661817671761): removes Content Creator and Tournament Winner,
+    keeps R6 SuperStar Low and Ranked (if they exist in badge_definitions).
+    """
+    if not is_developer(interaction.user):
+        await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True)
+        return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    await interaction.response.defer(ephemeral=True)
+    async with pool.acquire() as db:
+        if user:
+            # Remove badges for a specific user that are not in badge_definitions.
+            removed = await db.fetch("""
+            DELETE FROM player_badges
+            WHERE guild_id=$1 AND user_id=$2
+              AND badge_id NOT IN (SELECT id FROM badge_definitions)
+            RETURNING badge_id, user_id;
+            """, guild_id, user.id)
+        else:
+            # Remove all orphaned badge entries across all users.
+            removed = await db.fetch("""
+            DELETE FROM player_badges
+            WHERE guild_id=$1
+              AND badge_id NOT IN (SELECT id FROM badge_definitions)
+            RETURNING badge_id, user_id;
+            """, guild_id)
+    if not removed:
+        await interaction.followup.send(
+            embed=discord.Embed(title="✅ No Cleanup Needed",
+                                description="All badge entries are valid.", color=discord.Color.green()),
+            ephemeral=True,
+        )
+        return
+    lines = [f"• <@{r['user_id']}> — `{r['badge_id']}`" for r in removed[:20]]
+    if len(removed) > 20:
+        lines.append(f"... and {len(removed) - 20} more.")
+    desc = f"Removed **{len(removed)}** legacy badge(s):\n\n" + "\n".join(lines)
+    embed = discord.Embed(title="🧹 Badge Cleanup Complete", description=desc, color=discord.Color.orange())
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+bot.tree.add_command(badgeadmin_group)
+
+
+# ---------------------------------------------------------------------------
+# /marketcommands — Paginated command reference (6 pages)
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="marketcommands", description="View EAS stock market commands by page.")
+@app_commands.describe(page="Page number: 1 Economy, 2 Market, 3 Trading, 4 Staff, 5 Developer, 6 Shop Admin")
+async def marketcommands_updated(interaction: discord.Interaction, page: int = 1):
+    """Paginated command reference for the EAS Stock Market Bot."""
+    pages = {
+        1: (
+            "📘 Economy Commands",
+            "`/register` — Accept Terms & Conditions and register\n"
+            "`/ping` — Bot status, latency & uptime\n"
+            "`/balance` — View your SP balance & wealth role\n"
+            "`/starpoints` — View your StarPoints balance\n"
+            "`/starpointprice` — View economy rates & wealth thresholds\n"
+            "`/daily` — Claim your daily $50,000 SP reward\n"
+            "`/marketcommands` — This command list\n\n"
+            "**Starting Balance:** $250,000 SP\n"
+            "**Daily Reward:** $50,000 SP\n\n"
+            "**Note:** All market commands require registration via `/register`",
+        ),
+        2: (
+            "📈 Market Commands",
+            "`/market` — View the Top 10 stock market\n"
+            "`/stock <player>` — View a player's stock details\n"
+            "`/marketleaderboard` — Top investors by net worth\n"
+            "`/shop` — Browse the investor shop\n"
+            "`/portfolio` — View your holdings & P/L\n"
+            "`/transactions` — Your recent trade history",
+        ),
+        3: (
+            "💹 Trading & Shop Commands",
+            "`/buy <player> <shares>` — Buy shares of a top 10 player\n"
+            "`/sell <player> <shares>` — Sell shares (3% tax)\n"
+            "`/buyitem <item_id>` — Purchase an item from the shop\n"
+            "`/resellitem <item_id>` — Resell an item for a partial refund\n"
+            "`/inventory` — View your purchased items\n"
+            "`/topstocks` — Highest priced stocks\n"
+            "`/gainers` — Recent biggest gainers\n"
+            "`/losers` — Recent biggest losers",
+        ),
+        4: (
+            "🛡️ Staff Commands",
+            "`/syncmarket` — Sync top 10 from ranked database\n"
+            "`/marketopen` — Open trading\n"
+            "`/marketclose` — Close trading\n"
+            "`/logresult` — Manually log a match result\n"
+            "`/freezeportfolio` — Log a portfolio freeze\n"
+            "`/unfreezeportfolio` — Log a portfolio unfreeze",
+        ),
+        5: (
+            "👑 Developer Commands",
+            "`/givepoints` — Give SP to a user\n"
+            "`/takepoints` — Take SP from a user\n"
+            "`/resetbalance` — Reset a user's balance\n"
+            "`/marketsimulate` — Trigger test-server simulation (test only)\n"
+            "`/marketresettest` — Reset test database (test only)\n"
+            "`/marketstatus` — Show database & mode status\n"
+            "`/marketforceupdate` — Force immediate market update\n"
+            "`/synccommands` — Re-register all slash commands\n\n"
+            f"Only developer ID `{DEVELOPER_USER_ID}` can use these.",
+        ),
+        6: (
+            "🛒 Shop Admin Commands",
+            "`/shopadmin list` — List all shop items\n"
+            "`/shopadmin create` — Create a new shop item\n"
+            "`/shopadmin edit` — Edit item name, description, rarity, badge/role\n"
+            "`/shopadmin stock` — View current stock levels\n"
+            "`/shopadmin restock` — Set max and current stock\n"
+            "`/shopadmin price` — Update price, min value, max value\n"
+            "`/shopadmin resale` — Set resale percentage\n"
+            "`/shopadmin enable` — Enable a disabled item\n"
+            "`/shopadmin disable` — Disable an item (with confirmation)\n"
+            "`/shopadmin delete` — Delete an item (with confirmation)\n"
+            "`/shopadmin history` — View price history & audit log\n\n"
+            "`/badgeadmin award` — Award a badge to a user\n"
+            "`/badgeadmin revoke` — Revoke a badge from a user\n"
+            "`/badgeadmin list` — List a user's badges\n"
+            "`/badgeadmin cleanup` — Remove legacy badge data",
+        ),
+    }
+    page = max(1, min(6, page))
+    title, desc = pages[page]
+    embed = discord.Embed(title=title, description=desc, color=discord.Color.gold())
+    embed.set_footer(text=f"Page {page}/6 • Use /marketcommands page:{page % 6 + 1} for next page")
     await interaction.response.send_message(embed=embed)
 
 
