@@ -1,6 +1,7 @@
 import os
 import math
 import json
+import random
 import asyncio
 import datetime
 from typing import Optional, List, Dict, Any, Tuple
@@ -14,18 +15,114 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-_raw_db_url = os.getenv("DATABASE_URL", "")
-# Strip any Railway-style reference placeholders that were not resolved.
-# A properly resolved URL starts with postgres:// or postgresql://.
-if _raw_db_url.startswith("${{") or not _raw_db_url:
-    DATABASE_URL: Optional[str] = None
-else:
-    # asyncpg requires the postgresql:// scheme; convert postgres:// if needed.
-    DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1) if _raw_db_url.startswith("postgres://") else _raw_db_url
 
-DEVELOPER_USER_ID = int(os.getenv("DEVELOPER_USER_ID", "733871667788644445"))
-TESTING_SERVER_ID = int(os.getenv("TESTING_SERVER_ID", "1511958538333851688"))
-MAIN_SERVER_ID = int(os.getenv("MAIN_SERVER_ID", "1467697766837915804"))
+def _resolve_db_url(raw: str) -> Optional[str]:
+    """Resolve and normalise a database URL, returning None if unset/unresolved."""
+    if not raw or raw.startswith("${{"):
+        return None
+    return raw.replace("postgres://", "postgresql://", 1) if raw.startswith("postgres://") else raw
+
+DATABASE_URL: Optional[str] = _resolve_db_url(os.getenv("DATABASE_URL", ""))
+TEST_DATABASE_URL: Optional[str] = _resolve_db_url(os.getenv("TEST_DATABASE_URL", ""))
+
+DEVELOPER_USER_ID = int(os.getenv("DEVELOPER_ID", os.getenv("DEVELOPER_USER_ID", "733871667788644445")))
+TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID", os.getenv("TESTING_SERVER_ID", "1511958538333851688")))
+MAIN_GUILD_ID = int(os.getenv("MAIN_GUILD_ID", os.getenv("MAIN_SERVER_ID", "1467697766837915804")))
+
+# Keep legacy names as aliases for any code that still references them.
+TESTING_SERVER_ID = TEST_GUILD_ID
+MAIN_SERVER_ID = MAIN_GUILD_ID
+
+# ---------------------------------------------------------------------------
+# Fake players for test-server simulation
+# ---------------------------------------------------------------------------
+FAKE_PLAYERS: List[Dict[str, Any]] = [
+    {"user_id": 9000000001, "name": "Test Player 1",  "cr": 12500, "wins": 450, "losses": 150, "kills": 8900, "mvps": 280, "streak": 15},
+    {"user_id": 9000000002, "name": "Test Player 2",  "cr": 11800, "wins": 420, "losses": 180, "kills": 8200, "mvps": 260, "streak": 12},
+    {"user_id": 9000000003, "name": "Test Player 3",  "cr": 11200, "wins": 400, "losses": 200, "kills": 7800, "mvps": 240, "streak": 10},
+    {"user_id": 9000000004, "name": "Test Player 4",  "cr": 10600, "wins": 380, "losses": 220, "kills": 7400, "mvps": 220, "streak":  8},
+    {"user_id": 9000000005, "name": "Test Player 5",  "cr": 10000, "wins": 360, "losses": 240, "kills": 7000, "mvps": 200, "streak":  6},
+    {"user_id": 9000000006, "name": "Test Player 6",  "cr":  9400, "wins": 340, "losses": 260, "kills": 6600, "mvps": 180, "streak":  5},
+    {"user_id": 9000000007, "name": "Test Player 7",  "cr":  8800, "wins": 320, "losses": 280, "kills": 6200, "mvps": 160, "streak":  4},
+    {"user_id": 9000000008, "name": "Test Player 8",  "cr":  8200, "wins": 300, "losses": 300, "kills": 5800, "mvps": 140, "streak":  3},
+    {"user_id": 9000000009, "name": "Test Player 9",  "cr":  7600, "wins": 280, "losses": 320, "kills": 5400, "mvps": 120, "streak":  2},
+    {"user_id": 9000000010, "name": "Test Player 10", "cr":  7000, "wins": 260, "losses": 340, "kills": 5000, "mvps": 100, "streak":  1},
+]
+
+# ---------------------------------------------------------------------------
+# DatabaseManager — dual-pool routing
+# ---------------------------------------------------------------------------
+
+class DatabaseManager:
+    """Manages two asyncpg connection pools: one for main, one for test."""
+
+    def __init__(self) -> None:
+        self.db_pool_main: Optional[asyncpg.Pool] = None
+        self.db_pool_test: Optional[asyncpg.Pool] = None
+
+    async def get_pool(self, guild_id: int) -> asyncpg.Pool:
+        """Return the appropriate connection pool for this guild."""
+        if guild_id == MAIN_GUILD_ID:
+            if self.db_pool_main is None:
+                raise RuntimeError("Main database pool is not initialised.")
+            return self.db_pool_main
+        elif guild_id == TEST_GUILD_ID:
+            if self.db_pool_test is None:
+                raise RuntimeError("Test database pool is not initialised.")
+            return self.db_pool_test
+        else:
+            raise ValueError(f"Unknown guild_id: {guild_id}. Only main ({MAIN_GUILD_ID}) and test ({TEST_GUILD_ID}) servers are supported.")
+
+    async def init_pools(self) -> None:
+        """Initialise both connection pools."""
+        if DATABASE_URL:
+            try:
+                self.db_pool_main = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+                async with self.db_pool_main.acquire() as _conn:
+                    await _conn.fetchval("SELECT 1")
+                print("[DB] ✅ Main Database Connected (DATABASE_URL)")
+            except Exception as exc:
+                print(f"[DB] ❌ Main Database connection failed: {exc}")
+                self.db_pool_main = None
+        else:
+            print("[DB] ⚠️  DATABASE_URL not set — main database unavailable.")
+
+        if TEST_DATABASE_URL:
+            try:
+                self.db_pool_test = await asyncpg.create_pool(TEST_DATABASE_URL, min_size=1, max_size=5)
+                async with self.db_pool_test.acquire() as _conn:
+                    await _conn.fetchval("SELECT 1")
+                print("[DB] ✅ Test Database Connected (TEST_DATABASE_URL)")
+            except Exception as exc:
+                print(f"[DB] ❌ Test Database connection failed: {exc}")
+                self.db_pool_test = None
+        else:
+            print("[DB] ⚠️  TEST_DATABASE_URL not set — test database unavailable.")
+
+
+db_manager = DatabaseManager()
+
+# ---------------------------------------------------------------------------
+# Guild validation helpers
+# ---------------------------------------------------------------------------
+
+def validate_guild(guild_id: int) -> bool:
+    """Return True if guild_id is the testing or main server."""
+    return guild_id in (TEST_GUILD_ID, MAIN_GUILD_ID)
+
+
+def get_mode(guild_id: int) -> str:
+    """Return 'test' or 'main' based on guild_id."""
+    if guild_id == TEST_GUILD_ID:
+        return "test"
+    elif guild_id == MAIN_GUILD_ID:
+        return "main"
+    return "unknown"
+
+
+def mode_label(guild_id: int) -> str:
+    """Return a human-readable mode label for embeds."""
+    return "🧪 TEST MODE" if guild_id == TEST_GUILD_ID else "🔴 LIVE MODE"
 
 STAFF_ROLE_IDS = {
     1473033115818786909,
@@ -81,6 +178,8 @@ RANKED_DATA_COLUMN = os.getenv("RANKED_DATA_COLUMN", "data")
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+# Legacy single-pool reference — kept for backward compatibility with helper
+# functions that haven't been migrated to pool-parameter style yet.
 db_pool: Optional[asyncpg.Pool] = None
 bot_start_time: Optional[datetime.datetime] = None
 
@@ -267,28 +366,12 @@ async def detect_ranked_schema(pool: asyncpg.Pool) -> Dict[str, str]:
     return detected
 
 
-async def init_db() -> None:
-    """Initialise the database connection pool and create all market_ tables.
+async def _create_market_tables(pool: asyncpg.Pool, mode: str) -> None:
+    """Create all market_ tables in the given pool.
 
-    All tables use the market_ prefix and have NO foreign key constraints
-    pointing at the ranked players table, preventing FK violation crashes.
+    mode is 'main' or 'test' — used only for logging.
     """
-    global db_pool
-    if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL is missing or was not resolved. "
-            "Ensure the Railway variable reference is correctly linked."
-        )
-    try:
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        # Validate the connection immediately.
-        async with db_pool.acquire() as _conn:
-            await _conn.fetchval("SELECT 1")
-        print("[DB] ✅ Connected to PostgreSQL successfully.")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to connect to PostgreSQL: {exc}") from exc
-
-    async with db_pool.acquire() as db:
+    async with pool.acquire() as db:
         # ------------------------------------------------------------------ #
         # market_users — balances, daily claims, wealth roles.
         # No FK to players table; guild_id + user_id are standalone.
@@ -457,28 +540,213 @@ async def init_db() -> None:
             if result == "INSERT 0 1":
                 seeded += 1
         if seeded:
-            print(f"[Shop] ✅ Seeded {seeded} new shop items into market_shop_items.")
+            print(f"[Shop/{mode}] ✅ Seeded {seeded} new shop items.")
         else:
-            print("[Shop] ✅ Shop items already present — no seeding needed.")
+            print(f"[Shop/{mode}] ✅ Shop items already present — no seeding needed.")
 
-    print("[DB] ✅ All market_ tables verified/created.")
-
-    # Run schema auto-detection after tables are created.
-    schema = await detect_ranked_schema(db_pool)
-    print(
-        f"[Schema] ✅ Ranked table: '{schema['table']}' | "
-        f"user_id='{schema['user_id_col']}' guild_id='{schema['guild_id_col']}' "
-        f"data='{schema['data_col']}'"
-    )
+    print(f"[DB/{mode}] ✅ All market_ tables verified/created.")
 
 
-async def ensure_user(guild_id: int, user_id: int) -> None:
+async def seed_fake_players(test_pool: asyncpg.Pool) -> None:
+    """Create fake players and initial stocks in the test database.
+
+    Fake player IDs (9000000001–9000000010) never conflict with real Discord
+    user IDs, so they are completely safe to store alongside real user data.
+    """
+    guild_id = TEST_GUILD_ID
+    async with test_pool.acquire() as db:
+        for index, player in enumerate(FAKE_PLAYERS, start=1):
+            data: Dict[str, Any] = {
+                "cr":     player["cr"],
+                "wins":   player["wins"],
+                "losses": player["losses"],
+                "kills":  player["kills"],
+                "mvps":   player["mvps"],
+                "streak": player["streak"],
+            }
+            price = base_price_from_ranked_data(data, index)
+
+            existing = await db.fetchval(
+                "SELECT player_id FROM market_stocks WHERE guild_id=$1 AND player_id=$2;",
+                guild_id, player["user_id"],
+            )
+            if existing is None:
+                await db.execute("""
+                INSERT INTO market_stocks
+                    (guild_id, player_id, price, rank_position, active,
+                     cr, wins, losses, kills, mvps, streak)
+                VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (guild_id, player_id) DO NOTHING;
+                """,
+                    guild_id, player["user_id"], price, index,
+                    player["cr"], player["wins"], player["losses"],
+                    player["kills"], player["mvps"], player["streak"],
+                )
+                await db.execute("""
+                INSERT INTO market_stock_history
+                    (guild_id, player_id, old_price, new_price, reason)
+                VALUES ($1, $2, $3, $4, 'Initial seed');
+                """, guild_id, player["user_id"], price, price)
+
+    print(f"[Sim] ✅ Fake players seeded in test database ({len(FAKE_PLAYERS)} players).")
+
+
+async def simulate_market_movement(test_pool: asyncpg.Pool) -> List[Dict[str, Any]]:
+    """Simulate realistic daily market movement for the test server.
+
+    For each fake player:
+    1. Adjust CR randomly by ±100 to ±500.
+    2. Recalculate Top 10 positions by new CR.
+    3. Apply position movement bonuses/penalties.
+    4. Update prices with 70/30 weighted average.
+    5. Record changes in market_stock_history.
+    6. Ensure realistic swings (2–5% daily).
+
+    Returns a list of dicts describing each player's price change.
+    """
+    guild_id = TEST_GUILD_ID
+    results: List[Dict[str, Any]] = []
+
+    async with test_pool.acquire() as db:
+        # Fetch current fake player stocks.
+        rows = await db.fetch("""
+        SELECT player_id, price, rank_position, cr, wins, losses, kills, mvps, streak
+        FROM market_stocks
+        WHERE guild_id=$1 AND player_id >= 9000000001 AND player_id <= 9000000010
+        ORDER BY rank_position ASC;
+        """, guild_id)
+
+        if not rows:
+            return results
+
+        # Step 1: Adjust each player's CR randomly.
+        updated: List[Dict[str, Any]] = []
+        for r in rows:
+            delta = random.randint(100, 500) * random.choice([-1, 1])
+            new_cr = max(1000, int(r["cr"]) + delta)
+            updated.append({
+                "player_id":    int(r["player_id"]),
+                "old_price":    int(r["price"]),
+                "old_position": int(r["rank_position"]),
+                "cr":           new_cr,
+                "wins":         int(r["wins"]),
+                "losses":       int(r["losses"]),
+                "kills":        int(r["kills"]),
+                "mvps":         int(r["mvps"]),
+                "streak":       int(r["streak"]),
+            })
+
+        # Step 2: Re-sort by new CR to determine new positions.
+        updated.sort(key=lambda x: x["cr"], reverse=True)
+
+        for new_index, player in enumerate(updated, start=1):
+            player["new_position"] = new_index
+            data: Dict[str, Any] = {
+                "cr":     player["cr"],
+                "wins":   player["wins"],
+                "losses": player["losses"],
+                "kills":  player["kills"],
+                "mvps":   player["mvps"],
+                "streak": player["streak"],
+            }
+            base_price = base_price_from_ranked_data(data, new_index)
+            old_price = player["old_price"]
+            old_position = player["old_position"]
+
+            # Step 3 & 4: Weighted average + position movement bonus/penalty.
+            blended = max(1000, int((old_price * 0.70) + (base_price * 0.30)))
+            position_delta = old_position - new_index  # positive = moved up
+
+            if position_delta > 0:
+                boost = 0.025 * position_delta
+                final_price = max(1000, int(blended * (1 + boost)))
+                reason = f"Simulation: moved up #{old_position}→#{new_index} (+{position_delta})"
+            elif position_delta < 0:
+                penalty = 0.015 * abs(position_delta)
+                final_price = max(1000, int(blended * (1 - penalty)))
+                reason = f"Simulation: moved down #{old_position}→#{new_index} ({position_delta})"
+            else:
+                # Apply a small random daily swing (2–5%).
+                swing_pct = random.uniform(0.02, 0.05) * random.choice([-1, 1])
+                final_price = max(1000, int(blended * (1 + swing_pct)))
+                direction = "▲" if swing_pct > 0 else "▼"
+                reason = f"Simulation: daily swing {direction}{abs(swing_pct)*100:.1f}%"
+
+            player["new_price"] = final_price
+            player["reason"] = reason
+
+            # Step 5: Persist updates.
+            await db.execute("""
+            UPDATE market_stocks
+            SET price=$1, rank_position=$2, previous_rank_position=$3,
+                cr=$4, updated_at=NOW()
+            WHERE guild_id=$5 AND player_id=$6;
+            """, final_price, new_index, old_position,
+                player["cr"], guild_id, player["player_id"])
+
+            if final_price != old_price:
+                await db.execute("""
+                INSERT INTO market_stock_history
+                    (guild_id, player_id, old_price, new_price, reason)
+                VALUES ($1, $2, $3, $4, $5);
+                """, guild_id, player["player_id"], old_price, final_price, reason)
+
+            results.append({
+                "player_id":    player["player_id"],
+                "old_price":    old_price,
+                "new_price":    final_price,
+                "old_position": old_position,
+                "new_position": new_index,
+                "reason":       reason,
+            })
+
+    return results
+
+
+async def reset_test_database(test_pool: asyncpg.Pool) -> None:
+    """Clear all test-server market data and re-seed fake players."""
+    guild_id = TEST_GUILD_ID
+    async with test_pool.acquire() as db:
+        await db.execute("DELETE FROM market_stock_history WHERE guild_id=$1;", guild_id)
+        await db.execute("DELETE FROM market_transactions WHERE guild_id=$1;", guild_id)
+        await db.execute("DELETE FROM market_holdings WHERE guild_id=$1;", guild_id)
+        await db.execute("DELETE FROM market_users WHERE guild_id=$1;", guild_id)
+        await db.execute("DELETE FROM market_stocks WHERE guild_id=$1;", guild_id)
+        await db.execute("DELETE FROM market_settings WHERE guild_id=$1;", guild_id)
+    print("[Sim] ✅ Test database cleared.")
+    await seed_fake_players(test_pool)
+
+
+async def init_db(pool: asyncpg.Pool, mode: str) -> None:
+    """Initialise market_ tables in the given pool.
+
+    mode is 'main' or 'test' — controls seeding behaviour.
+    For the test database, fake players are seeded after table creation.
+    For the main database, schema auto-detection is run.
+    """
+    await _create_market_tables(pool, mode)
+
+    if mode == "main":
+        # Run schema auto-detection so sync_top10_for_guild uses correct columns.
+        schema = await detect_ranked_schema(pool)
+        print(
+            f"[Schema] ✅ Ranked table: '{schema['table']}' | "
+            f"user_id='{schema['user_id_col']}' guild_id='{schema['guild_id_col']}' "
+            f"data='{schema['data_col']}'"
+        )
+    elif mode == "test":
+        await seed_fake_players(pool)
+
+
+async def ensure_user(guild_id: int, user_id: int, pool: Optional[asyncpg.Pool] = None) -> None:
     """Create a market_users row for this guild/user if one does not exist yet.
 
     New users start with STARTING_SP ($250,000) balance.
+    Accepts an explicit pool; falls back to the legacy db_pool global.
     """
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+    _pool = pool or db_pool
+    assert _pool is not None
+    async with _pool.acquire() as db:
         await db.execute("""
         INSERT INTO market_users (guild_id, user_id, balance)
         VALUES ($1, $2, $3)
@@ -498,16 +766,17 @@ def compute_wealth_role(balance: int) -> Optional[str]:
     return None
 
 
-async def update_wealth_role(guild_id: int, user_id: int, balance: int) -> Optional[str]:
+async def update_wealth_role(guild_id: int, user_id: int, balance: int, pool: Optional[asyncpg.Pool] = None) -> Optional[str]:
     """Compute and persist the wealth role for a user based on their balance.
 
     Updates market_users.wealth_role and inserts a record into
     market_wealth_roles when the role changes.  Returns the new role name
     (or None if below all thresholds).
     """
-    assert db_pool is not None
+    _pool = pool or db_pool
+    assert _pool is not None
     role_name = compute_wealth_role(balance)
-    async with db_pool.acquire() as db:
+    async with _pool.acquire() as db:
         current = await db.fetchval(
             "SELECT wealth_role FROM market_users WHERE guild_id=$1 AND user_id=$2;",
             guild_id, user_id,
@@ -526,9 +795,10 @@ async def update_wealth_role(guild_id: int, user_id: int, balance: int) -> Optio
     return role_name
 
 
-async def market_is_open(guild_id: int) -> bool:
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+async def market_is_open(guild_id: int, pool: Optional[asyncpg.Pool] = None) -> bool:
+    _pool = pool or db_pool
+    assert _pool is not None
+    async with _pool.acquire() as db:
         await db.execute("""
         INSERT INTO market_settings (guild_id, market_open)
         VALUES ($1, TRUE)
@@ -537,18 +807,20 @@ async def market_is_open(guild_id: int) -> bool:
         return bool(await db.fetchval("SELECT market_open FROM market_settings WHERE guild_id=$1;", guild_id))
 
 
-async def get_stock(guild_id: int, player_id: int):
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+async def get_stock(guild_id: int, player_id: int, pool: Optional[asyncpg.Pool] = None):
+    _pool = pool or db_pool
+    assert _pool is not None
+    async with _pool.acquire() as db:
         return await db.fetchrow("""
         SELECT * FROM market_stocks
         WHERE guild_id=$1 AND player_id=$2 AND active=true AND rank_position BETWEEN 1 AND 10;
         """, guild_id, player_id)
 
 
-async def total_shares(guild_id: int, player_id: int) -> int:
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+async def total_shares(guild_id: int, player_id: int, pool: Optional[asyncpg.Pool] = None) -> int:
+    _pool = pool or db_pool
+    assert _pool is not None
+    async with _pool.acquire() as db:
         val = await db.fetchval("""
         SELECT COALESCE(SUM(shares), 0) FROM market_holdings
         WHERE guild_id=$1 AND player_id=$2;
@@ -556,9 +828,10 @@ async def total_shares(guild_id: int, player_id: int) -> int:
         return safe_int(val)
 
 
-async def update_price(guild_id: int, player_id: int, new_price: int, reason: str) -> tuple[int, int]:
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+async def update_price(guild_id: int, player_id: int, new_price: int, reason: str, pool: Optional[asyncpg.Pool] = None) -> tuple[int, int]:
+    _pool = pool or db_pool
+    assert _pool is not None
+    async with _pool.acquire() as db:
         old_price = await db.fetchval("""
         SELECT price FROM market_stocks WHERE guild_id=$1 AND player_id=$2;
         """, guild_id, player_id)
@@ -580,13 +853,34 @@ async def sync_top10_for_guild(guild: discord.Guild) -> int:
     """
     Pull top 10 by CR from the ranked players table and update market listings.
     Only processes players belonging to this specific guild (guild_id filter).
+
+    For the main server: reads real players from the ranked table.
+    For the test server: reads fake players from market_stocks (simulation).
+
     Players entering the Top 10 get a new stock; players leaving are marked inactive
     (all holdings and history are preserved). Price movements are smoothed with a
     70/30 weighted average and boosted/penalised based on position delta.
     """
-    assert db_pool is not None
     guild_id = guild.id
 
+    # Route to the correct pool based on guild_id.
+    try:
+        pool = await db_manager.get_pool(guild_id)
+    except (ValueError, RuntimeError) as exc:
+        print(f"[Sync] Skipping guild {guild_id}: {exc}")
+        return 0
+
+    # Test server uses fake players — simulation handles price updates separately.
+    # We still run a lightweight sync to ensure active flags are correct.
+    if guild_id == TEST_GUILD_ID:
+        async with pool.acquire() as db:
+            count = await db.fetchval(
+                "SELECT COUNT(*) FROM market_stocks WHERE guild_id=$1 AND active=true;",
+                guild_id,
+            )
+        return int(count or 0)
+
+    # Main server: read real players from the ranked table.
     # Use module-level globals (potentially updated by detect_ranked_schema).
     # Column/table names come from config only — never from user input.
     query = f"""
@@ -597,7 +891,7 @@ async def sync_top10_for_guild(guild: discord.Guild) -> int:
     LIMIT 10;
     """
 
-    async with db_pool.acquire() as db:
+    async with pool.acquire() as db:
         try:
             ranked_rows = await db.fetch(query, guild_id)
         except Exception as exc:
@@ -696,59 +990,83 @@ async def sync_top10_for_guild(guild: discord.Guild) -> int:
 
 @tasks.loop(minutes=TOP10_SYNC_MINUTES)
 async def top10_sync_loop():
-    # Only sync guilds the bot is actually in; guild_id filter inside the function
-    # ensures testing and production data never mix.
+    """Background loop: sync main-server Top 10 and run test-server simulation."""
     for guild in bot.guilds:
-        await sync_top10_for_guild(guild)
+        if guild.id == MAIN_GUILD_ID:
+            await sync_top10_for_guild(guild)
+        elif guild.id == TEST_GUILD_ID:
+            # Run market simulation for the test server every cycle.
+            if db_manager.db_pool_test is not None:
+                try:
+                    await simulate_market_movement(db_manager.db_pool_test)
+                except Exception as exc:
+                    print(f"[Sim] ⚠️  Simulation tick failed: {exc}")
 
 
 @bot.event
 async def on_ready():
     """Discord on_ready handler — runs once after the bot logs in.
 
-    Initialises the database, starts the Top 10 sync loop, and syncs slash
-    commands to the testing server.  Comprehensive startup logs are printed
+    Initialises both database pools, starts the Top 10 sync loop, and syncs
+    slash commands to both servers.  Comprehensive startup logs are printed
     so Railway deployment logs are easy to read.
     """
-    global bot_start_time
+    global bot_start_time, db_pool
     bot_start_time = datetime.datetime.utcnow()
 
     print("=" * 60)
-    print("[Startup] EAS Stock Market Bot — Phase 1")
+    print("[Startup] EAS Stock Market Bot — Phase 1B (Dual-Database)")
     print(f"[Startup] Logged in as: {bot.user} (ID: {bot.user.id})")
-    print(f"[Startup] Testing Server ID : {TESTING_SERVER_ID}")
-    print(f"[Startup] Main Server ID    : {MAIN_SERVER_ID}")
-    print(f"[Startup] Developer User ID : {DEVELOPER_USER_ID}")
-    print(f"[Startup] Starting Balance  : ${STARTING_SP:,}")
-    print(f"[Startup] Daily Reward      : ${DAILY_SP:,}")
-    print(f"[Startup] Top 10 Sync Every : {TOP10_SYNC_MINUTES} minutes")
+    print(f"[Startup] Developer ID: {DEVELOPER_USER_ID}")
     print("=" * 60)
 
-    # Initialise database — creates all market_ tables and seeds shop items.
-    try:
-        await init_db()
-    except Exception as exc:
-        print(f"[Startup] ❌ Database initialisation failed: {exc}")
-        return
+    # Initialise both database pools.
+    await db_manager.init_pools()
 
-    # Start the background Top 10 sync loop.
+    # Initialise main database tables.
+    if db_manager.db_pool_main is not None:
+        try:
+            await init_db(db_manager.db_pool_main, "main")
+            # Keep legacy db_pool pointing at main for backward-compat helpers.
+            db_pool = db_manager.db_pool_main
+            print(f"[Startup] ✅ Main Server ({MAIN_GUILD_ID}) — LIVE MODE")
+        except Exception as exc:
+            print(f"[Startup] ❌ Main database init failed: {exc}")
+    else:
+        print(f"[Startup] ⚠️  Main Server ({MAIN_GUILD_ID}) — database unavailable")
+
+    # Initialise test database tables and seed fake players.
+    if db_manager.db_pool_test is not None:
+        try:
+            await init_db(db_manager.db_pool_test, "test")
+            print(f"[Startup] ✅ Test Server ({TEST_GUILD_ID}) — SIMULATION MODE")
+            print("[Startup] ✅ Fake players seeded in test database")
+        except Exception as exc:
+            print(f"[Startup] ❌ Test database init failed: {exc}")
+    else:
+        print(f"[Startup] ⚠️  Test Server ({TEST_GUILD_ID}) — database unavailable")
+
+    # Start the background Top 10 sync / simulation loop.
     if not top10_sync_loop.is_running():
         top10_sync_loop.start()
-        print(f"[Startup] ✅ Top 10 sync loop started (every {TOP10_SYNC_MINUTES} min).")
+        print(f"[Startup] ✅ Market auto-update loop started (every {TOP10_SYNC_MINUTES} min)")
     else:
-        print("[Startup] ℹ️  Top 10 sync loop already running.")
+        print("[Startup] ℹ️  Market auto-update loop already running.")
 
-    # Sync slash commands only to the testing server during development.
-    # To go live: replace with await bot.tree.sync() (global sync).
-    testing_guild = discord.Object(id=TESTING_SERVER_ID)
-    try:
-        synced = await bot.tree.sync(guild=testing_guild)
-        print(f"[Startup] ✅ Synced {len(synced)} slash command(s) to testing server {TESTING_SERVER_ID}.")
-    except Exception as exc:
-        print(f"[Startup] ⚠️  Command sync failed: {exc}")
+    # Sync slash commands to both servers.
+    synced_count = 0
+    for guild_id in (TEST_GUILD_ID, MAIN_GUILD_ID):
+        guild_obj = discord.Object(id=guild_id)
+        try:
+            synced = await bot.tree.sync(guild=guild_obj)
+            synced_count = len(synced)
+            label = "testing" if guild_id == TEST_GUILD_ID else "main"
+            print(f"[Startup] ✅ Synced {synced_count} slash commands to {label} server ({guild_id})")
+        except Exception as exc:
+            print(f"[Startup] ⚠️  Command sync failed for guild {guild_id}: {exc}")
 
     print("=" * 60)
-    print(f"[Startup] ✅ EAS Stock Market Bot is READY — {bot.user}")
+    print("[Startup] ✅ EAS Stock Market Bot is READY")
     print("=" * 60)
 
 
@@ -757,19 +1075,61 @@ async def send_embed(interaction: discord.Interaction, title: str, description: 
     await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
 
 
+async def validate_guild_and_get_pool(interaction: discord.Interaction) -> Optional[asyncpg.Pool]:
+    """Validate that the interaction comes from a known guild and return its pool.
+
+    Returns None (after sending an error embed) if the guild is not recognised.
+    """
+    if interaction.guild is None:
+        await send_embed(
+            interaction,
+            "❌ Server Required",
+            "This command must be used inside a server.",
+            discord.Color.red(),
+            True,
+        )
+        return None
+    guild_id = interaction.guild.id
+    if not validate_guild(guild_id):
+        await send_embed(
+            interaction,
+            "❌ Invalid Server",
+            f"This bot only works in the testing server (`{TEST_GUILD_ID}`) "
+            f"or main server (`{MAIN_GUILD_ID}`).",
+            discord.Color.red(),
+            True,
+        )
+        return None
+    try:
+        return await db_manager.get_pool(guild_id)
+    except RuntimeError as exc:
+        await send_embed(
+            interaction,
+            "❌ Database Unavailable",
+            str(exc),
+            discord.Color.red(),
+            True,
+        )
+        return None
+
+
 @bot.tree.command(name="ping", description="Check if the EAS Stock Market Bot is online.")
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
 
-    # Database connection check.
-    db_status = "❌ Disconnected"
-    if db_pool is not None:
+    # Per-database connection check.
+    async def _check_pool(pool: Optional[asyncpg.Pool]) -> str:
+        if pool is None:
+            return "❌ Disconnected"
         try:
-            async with db_pool.acquire() as _conn:
+            async with pool.acquire() as _conn:
                 await _conn.fetchval("SELECT 1")
-            db_status = "✅ Connected"
+            return "✅ Connected"
         except Exception:
-            db_status = "⚠️ Error"
+            return "⚠️ Error"
+
+    main_status = await _check_pool(db_manager.db_pool_main)
+    test_status = await _check_pool(db_manager.db_pool_test)
 
     # Uptime calculation.
     if bot_start_time is not None:
@@ -781,9 +1141,14 @@ async def ping(interaction: discord.Interaction):
     else:
         uptime_str = "Unknown"
 
+    guild_id = interaction.guild.id if interaction.guild else 0
+    current_mode = mode_label(guild_id) if validate_guild(guild_id) else "⚠️ Unknown Server"
+
     desc = (
         f"**Latency:** {latency}ms\n"
-        f"**Database:** {db_status}\n"
+        f"**Mode:** {current_mode}\n"
+        f"**Main DB:** {main_status}\n"
+        f"**Test DB:** {test_status}\n"
         f"**Uptime:** {uptime_str}"
     )
     await send_embed(interaction, "🏓 Pong", desc, discord.Color.green())
@@ -833,7 +1198,10 @@ async def marketcommands(interaction: discord.Interaction, page: int = 1):
             "👑 Developer Commands",
             "`/givepoints` — Give SP to a user\n"
             "`/takepoints` — Take SP from a user\n"
-            "`/resetbalance` — Reset a user's balance\n\n"
+            "`/resetbalance` — Reset a user's balance\n"
+            "`/marketsimulate` — Trigger test-server simulation (test only)\n"
+            "`/marketresettest` — Reset test database (test only)\n"
+            "`/marketstatus` — Show database & mode status\n\n"
             f"Only developer ID `{DEVELOPER_USER_ID}` can use these.",
         ),
     }
@@ -847,12 +1215,15 @@ async def marketcommands(interaction: discord.Interaction, page: int = 1):
 @bot.tree.command(name="balance", description="View your StarPoints balance and wealth role.")
 async def balance(interaction: discord.Interaction):
     """Show the caller's current balance, wealth role, and next wealth milestone."""
-    await ensure_user(interaction.guild.id, interaction.user.id)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    await ensure_user(guild_id, interaction.user.id, pool)
+    async with pool.acquire() as db:
         row = await db.fetchrow(
             "SELECT balance, wealth_role FROM market_users WHERE guild_id=$1 AND user_id=$2;",
-            interaction.guild.id, interaction.user.id,
+            guild_id, interaction.user.id,
         )
     bal = int(row["balance"])
     role = row["wealth_role"] or "None"
@@ -876,25 +1247,28 @@ async def balance(interaction: discord.Interaction):
         desc += "**Status:** 🏆 Maximum wealth role achieved!"
 
     embed = discord.Embed(title="⭐ StarPoints Balance", description=desc, color=discord.Color.gold())
-    embed.set_footer(text=f"Guild: {interaction.guild.name}")
+    embed.set_footer(text=f"Guild: {interaction.guild.name} • {mode_label(guild_id)}")
     await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="daily", description="Claim your daily StarPoints reward.")
 async def daily(interaction: discord.Interaction):
     """Claim the daily $50,000 SP reward (once per 24 hours)."""
-    await ensure_user(interaction.guild.id, interaction.user.id)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    await ensure_user(guild_id, interaction.user.id, pool)
+    async with pool.acquire() as db:
         can_claim = await db.fetchval("""
         SELECT last_daily IS NULL OR last_daily < NOW() - INTERVAL '24 hours'
         FROM market_users WHERE guild_id=$1 AND user_id=$2;
-        """, interaction.guild.id, interaction.user.id)
+        """, guild_id, interaction.user.id)
         if not can_claim:
             # Calculate time remaining until next claim.
             next_claim = await db.fetchval(
                 "SELECT last_daily + INTERVAL '24 hours' FROM market_users WHERE guild_id=$1 AND user_id=$2;",
-                interaction.guild.id, interaction.user.id,
+                guild_id, interaction.user.id,
             )
             now = datetime.datetime.utcnow()
             if next_claim:
@@ -913,18 +1287,18 @@ async def daily(interaction: discord.Interaction):
             return
         await db.execute(
             "UPDATE market_users SET balance=balance+$1, last_daily=NOW() WHERE guild_id=$2 AND user_id=$3;",
-            DAILY_SP, interaction.guild.id, interaction.user.id,
+            DAILY_SP, guild_id, interaction.user.id,
         )
         new_balance = await db.fetchval(
             "SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;",
-            interaction.guild.id, interaction.user.id,
+            guild_id, interaction.user.id,
         )
         await db.execute(
             "INSERT INTO market_transactions (guild_id, investor_id, type, total) VALUES ($1,$2,'daily',$3);",
-            interaction.guild.id, interaction.user.id, DAILY_SP,
+            guild_id, interaction.user.id, DAILY_SP,
         )
     # Update wealth role after balance change.
-    new_role = await update_wealth_role(interaction.guild.id, interaction.user.id, int(new_balance))
+    new_role = await update_wealth_role(guild_id, interaction.user.id, int(new_balance), pool)
     desc = f"You received **{money(DAILY_SP)}**!\n**New Balance:** {money(int(new_balance))}"
     if new_role:
         desc += f"\n**Wealth Role:** {new_role}"
@@ -933,30 +1307,53 @@ async def daily(interaction: discord.Interaction):
 
 @bot.tree.command(name="market", description="View the EAS Top 10 stock market.")
 async def market(interaction: discord.Interaction):
-    await sync_top10_for_guild(interaction.guild)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
-        rows = await db.fetch("SELECT * FROM market_stocks WHERE guild_id=$1 AND active=true ORDER BY rank_position ASC LIMIT 10;", interaction.guild.id)
-    if not rows:
-        await send_embed(interaction, "📈 EAS Exchange", "No top 10 stocks found yet. Staff can run `/syncmarket` after the ranked database is connected.", discord.Color.red())
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
         return
-    desc = ""
+    guild_id = interaction.guild.id
+    await sync_top10_for_guild(interaction.guild)
+    async with pool.acquire() as db:
+        rows = await db.fetch(
+            "SELECT * FROM market_stocks WHERE guild_id=$1 AND active=true ORDER BY rank_position ASC LIMIT 10;",
+            guild_id,
+        )
+    if not rows:
+        no_data_msg = (
+            "No simulation data yet. Use `/marketsimulate` to seed fake players."
+            if guild_id == TEST_GUILD_ID
+            else "No top 10 stocks found yet. Staff can run `/syncmarket` after the ranked database is connected."
+        )
+        await send_embed(interaction, "📈 EAS Exchange", no_data_msg, discord.Color.red())
+        return
+    desc = f"*{mode_label(guild_id)}*\n\n"
     for r in rows:
-        member = interaction.guild.get_member(int(r["player_id"]))
-        name = member.display_name if member else f"User {r['player_id']}"
+        player_id = int(r["player_id"])
+        # For fake players, show their configured name; for real players, resolve member.
+        if 9000000001 <= player_id <= 9000000010:
+            fake = next((p for p in FAKE_PLAYERS if p["user_id"] == player_id), None)
+            name = fake["name"] if fake else f"Test Player {player_id}"
+        else:
+            member = interaction.guild.get_member(player_id)
+            name = member.display_name if member else f"User {player_id}"
         desc += f"**#{r['rank_position']} {name}** — `{money(r['price'])}` | CR: `{r['cr']:,}`\n"
     await send_embed(interaction, "📈 EAS Exchange — Top 10 Market", desc, discord.Color.green())
 
 
 @bot.tree.command(name="stock", description="View a top 10 player's stock.")
 async def stock(interaction: discord.Interaction, user: discord.Member):
-    row = await get_stock(interaction.guild.id, user.id)
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    row = await get_stock(guild_id, user.id, pool)
     if not row:
         await send_embed(interaction, "❌ Not Listed", "That player is not currently in the top 10 market.", discord.Color.red(), True)
         return
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
-        hist = await db.fetch("SELECT old_price,new_price,reason FROM market_stock_history WHERE guild_id=$1 AND player_id=$2 ORDER BY created_at DESC LIMIT 5;", interaction.guild.id, user.id)
+    async with pool.acquire() as db:
+        hist = await db.fetch(
+            "SELECT old_price,new_price,reason FROM market_stock_history WHERE guild_id=$1 AND player_id=$2 ORDER BY created_at DESC LIMIT 5;",
+            guild_id, user.id,
+        )
     movement = "No recent movement."
     if hist:
         lines = []
@@ -965,7 +1362,12 @@ async def stock(interaction: discord.Interaction, user: discord.Member):
             sign = "+" if diff >= 0 else ""
             lines.append(f"`{sign}{diff:,} SP` — {h['reason']}")
         movement = "\n".join(lines)
-    desc = f"**Price:** {money(row['price'])}\n**Top 10 Place:** #{row['rank_position']}\n**CR:** {row['cr']:,}\n**Wins:** {row['wins']}\n**Losses:** {row['losses']}\n**Kills:** {row['kills']}\n**MVPs:** {row['mvps']}\n**Streak:** {row['streak']}\n\n**Recent Movement**\n{movement}"
+    desc = (
+        f"**Price:** {money(row['price'])}\n**Top 10 Place:** #{row['rank_position']}\n"
+        f"**CR:** {row['cr']:,}\n**Wins:** {row['wins']}\n**Losses:** {row['losses']}\n"
+        f"**Kills:** {row['kills']}\n**MVPs:** {row['mvps']}\n**Streak:** {row['streak']}\n\n"
+        f"**Recent Movement**\n{movement}"
+    )
     await send_embed(interaction, f"📊 {user.display_name} Stock", desc, discord.Color.blue())
 
 
@@ -973,61 +1375,64 @@ async def stock(interaction: discord.Interaction, user: discord.Member):
 @app_commands.describe(user="The top 10 player whose stock you want to buy", shares="Number of shares to purchase")
 async def buy(interaction: discord.Interaction, user: discord.Member, shares: int):
     """Purchase shares of a top 10 player's stock."""
-    if not await market_is_open(interaction.guild.id):
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    if not await market_is_open(guild_id, pool):
         await send_embed(interaction, "🔒 Market Closed", "Trading is currently closed.", discord.Color.red(), True); return
     if shares <= 0:
         await send_embed(interaction, "❌ Invalid Shares", "Shares must be more than 0.", discord.Color.red(), True); return
     if user.id == interaction.user.id:
         await send_embed(interaction, "❌ Not Allowed", "You cannot buy your own stock.", discord.Color.red(), True); return
-    stock_row = await get_stock(interaction.guild.id, user.id)
+    stock_row = await get_stock(guild_id, user.id, pool)
     if not stock_row:
         await send_embed(interaction, "❌ Not Listed", "That player is not in the top 10 market.", discord.Color.red(), True); return
-    await ensure_user(interaction.guild.id, interaction.user.id)
-    assert db_pool is not None
+    await ensure_user(guild_id, interaction.user.id, pool)
     total_cost = int(stock_row["price"]) * shares
-    async with db_pool.acquire() as db:
+    async with pool.acquire() as db:
         u = await db.fetchrow(
             "SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;",
-            interaction.guild.id, interaction.user.id,
+            guild_id, interaction.user.id,
         )
         if u["balance"] < total_cost:
             await send_embed(interaction, "❌ Not Enough SP", f"You need **{money(total_cost)}** but have **{money(u['balance'])}**.", discord.Color.red(), True); return
-        current_total = await total_shares(interaction.guild.id, user.id)
+        current_total = await total_shares(guild_id, user.id, pool)
         current_owned = safe_int(await db.fetchval(
             "SELECT shares FROM market_holdings WHERE guild_id=$1 AND investor_id=$2 AND player_id=$3;",
-            interaction.guild.id, interaction.user.id, user.id,
+            guild_id, interaction.user.id, user.id,
         ))
         if (current_owned + shares) / max(1, current_total + shares) > MAX_OWNERSHIP_PERCENT:
             await send_embed(interaction, "❌ Ownership Limit", "You cannot own more than 25% of one player's market shares.", discord.Color.red(), True); return
         old = await db.fetchrow(
             "SELECT shares,average_price FROM market_holdings WHERE guild_id=$1 AND investor_id=$2 AND player_id=$3;",
-            interaction.guild.id, interaction.user.id, user.id,
+            guild_id, interaction.user.id, user.id,
         )
         if old:
             new_shares = old["shares"] + shares
             new_avg = math.floor(((old["shares"] * old["average_price"]) + total_cost) / new_shares)
             await db.execute(
                 "UPDATE market_holdings SET shares=$1, average_price=$2 WHERE guild_id=$3 AND investor_id=$4 AND player_id=$5;",
-                new_shares, new_avg, interaction.guild.id, interaction.user.id, user.id,
+                new_shares, new_avg, guild_id, interaction.user.id, user.id,
             )
         else:
             await db.execute(
                 "INSERT INTO market_holdings (guild_id,investor_id,player_id,shares,average_price) VALUES ($1,$2,$3,$4,$5);",
-                interaction.guild.id, interaction.user.id, user.id, shares, stock_row["price"],
+                guild_id, interaction.user.id, user.id, shares, stock_row["price"],
             )
         await db.execute(
             "UPDATE market_users SET balance=balance-$1 WHERE guild_id=$2 AND user_id=$3;",
-            total_cost, interaction.guild.id, interaction.user.id,
+            total_cost, guild_id, interaction.user.id,
         )
         new_balance = await db.fetchval(
             "SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;",
-            interaction.guild.id, interaction.user.id,
+            guild_id, interaction.user.id,
         )
         await db.execute(
             "INSERT INTO market_transactions (guild_id,investor_id,player_id,type,shares,price,total) VALUES ($1,$2,$3,'buy',$4,$5,$6);",
-            interaction.guild.id, interaction.user.id, user.id, shares, stock_row["price"], total_cost,
+            guild_id, interaction.user.id, user.id, shares, stock_row["price"], total_cost,
         )
-    await update_wealth_role(interaction.guild.id, interaction.user.id, int(new_balance))
+    await update_wealth_role(guild_id, interaction.user.id, int(new_balance), pool)
     await send_embed(
         interaction, "✅ Shares Purchased",
         f"Bought **{shares} shares** of **{user.display_name}** for **{money(total_cost)}**.\n**Remaining Balance:** {money(int(new_balance))}",
@@ -1039,19 +1444,22 @@ async def buy(interaction: discord.Interaction, user: discord.Member, shares: in
 @app_commands.describe(user="The player whose shares you want to sell", shares="Number of shares to sell")
 async def sell(interaction: discord.Interaction, user: discord.Member, shares: int):
     """Sell shares of a top 10 player's stock (3% sell tax applies)."""
-    if not await market_is_open(interaction.guild.id):
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    if not await market_is_open(guild_id, pool):
         await send_embed(interaction, "🔒 Market Closed", "Trading is currently closed.", discord.Color.red(), True); return
     if shares <= 0:
         await send_embed(interaction, "❌ Invalid Shares", "Shares must be more than 0.", discord.Color.red(), True); return
-    stock_row = await get_stock(interaction.guild.id, user.id)
+    stock_row = await get_stock(guild_id, user.id, pool)
     if not stock_row:
         await send_embed(interaction, "❌ Not Listed", "That player is not in the top 10 market.", discord.Color.red(), True); return
-    await ensure_user(interaction.guild.id, interaction.user.id)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+    await ensure_user(guild_id, interaction.user.id, pool)
+    async with pool.acquire() as db:
         h = await db.fetchrow(
             "SELECT shares FROM market_holdings WHERE guild_id=$1 AND investor_id=$2 AND player_id=$3;",
-            interaction.guild.id, interaction.user.id, user.id,
+            guild_id, interaction.user.id, user.id,
         )
         if not h or h["shares"] < shares:
             await send_embed(interaction, "❌ Not Enough Shares", f"You only own **{h['shares'] if h else 0} shares** of {user.display_name}.", discord.Color.red(), True); return
@@ -1062,26 +1470,26 @@ async def sell(interaction: discord.Interaction, user: discord.Member, shares: i
         if remaining <= 0:
             await db.execute(
                 "DELETE FROM market_holdings WHERE guild_id=$1 AND investor_id=$2 AND player_id=$3;",
-                interaction.guild.id, interaction.user.id, user.id,
+                guild_id, interaction.user.id, user.id,
             )
         else:
             await db.execute(
                 "UPDATE market_holdings SET shares=$1 WHERE guild_id=$2 AND investor_id=$3 AND player_id=$4;",
-                remaining, interaction.guild.id, interaction.user.id, user.id,
+                remaining, guild_id, interaction.user.id, user.id,
             )
         await db.execute(
             "UPDATE market_users SET balance=balance+$1 WHERE guild_id=$2 AND user_id=$3;",
-            net, interaction.guild.id, interaction.user.id,
+            net, guild_id, interaction.user.id,
         )
         new_balance = await db.fetchval(
             "SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;",
-            interaction.guild.id, interaction.user.id,
+            guild_id, interaction.user.id,
         )
         await db.execute(
             "INSERT INTO market_transactions (guild_id,investor_id,player_id,type,shares,price,total) VALUES ($1,$2,$3,'sell',$4,$5,$6);",
-            interaction.guild.id, interaction.user.id, user.id, shares, stock_row["price"], net,
+            guild_id, interaction.user.id, user.id, shares, stock_row["price"], net,
         )
-    await update_wealth_role(interaction.guild.id, interaction.user.id, int(new_balance))
+    await update_wealth_role(guild_id, interaction.user.id, int(new_balance), pool)
     await send_embed(
         interaction, "✅ Shares Sold",
         f"Sold **{shares} shares** of **{user.display_name}** for **{money(net)}** after {int(SELL_TAX*100)}% tax.\n**New Balance:** {money(int(new_balance))}",
@@ -1091,25 +1499,36 @@ async def sell(interaction: discord.Interaction, user: discord.Member, shares: i
 
 @bot.tree.command(name="portfolio", description="View your stock portfolio.")
 async def portfolio(interaction: discord.Interaction):
-    await ensure_user(interaction.guild.id, interaction.user.id)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
-        balance = await db.fetchval("SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;", interaction.guild.id, interaction.user.id)
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    await ensure_user(guild_id, interaction.user.id, pool)
+    async with pool.acquire() as db:
+        bal = await db.fetchval(
+            "SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;",
+            guild_id, interaction.user.id,
+        )
         rows = await db.fetch("""
         SELECT h.player_id, h.shares, h.average_price, s.price
         FROM market_holdings h
         JOIN market_stocks s ON h.guild_id=s.guild_id AND h.player_id=s.player_id
         WHERE h.guild_id=$1 AND h.investor_id=$2 AND s.active=true
         ORDER BY h.shares * s.price DESC;
-        """, interaction.guild.id, interaction.user.id)
+        """, guild_id, interaction.user.id)
     if not rows:
-        await send_embed(interaction, "📁 Portfolio", f"Wallet: **{money(balance)}**\nYou do not own any shares yet.", discord.Color.purple())
+        await send_embed(interaction, "📁 Portfolio", f"Wallet: **{money(bal)}**\nYou do not own any shares yet.", discord.Color.purple())
         return
     desc = ""
     value_total = 0
     for r in rows:
-        member = interaction.guild.get_member(int(r["player_id"]))
-        name = member.display_name if member else f"User {r['player_id']}"
+        player_id = int(r["player_id"])
+        if 9000000001 <= player_id <= 9000000010:
+            fake = next((p for p in FAKE_PLAYERS if p["user_id"] == player_id), None)
+            name = fake["name"] if fake else f"Test Player {player_id}"
+        else:
+            member = interaction.guild.get_member(player_id)
+            name = member.display_name if member else f"User {player_id}"
         value = int(r["shares"] * r["price"])
         cost = int(r["shares"] * r["average_price"])
         pl = value - cost
@@ -1117,17 +1536,21 @@ async def portfolio(interaction: discord.Interaction):
         value_total += value
         desc += f"**{name}** — {r['shares']} shares\nValue: `{money(value)}` | P/L: `{sign}{pl:,} SP`\n\n"
     embed = discord.Embed(title=f"📁 {interaction.user.display_name}'s Portfolio", description=desc[:3900], color=discord.Color.purple())
-    embed.add_field(name="Wallet", value=money(balance))
+    embed.add_field(name="Wallet", value=money(bal))
     embed.add_field(name="Portfolio", value=money(value_total))
-    embed.add_field(name="Net Worth", value=money(balance + value_total))
+    embed.add_field(name="Net Worth", value=money(bal + value_total))
+    embed.set_footer(text=mode_label(guild_id))
     await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="marketleaderboard", description="View the top investors by total net worth.")
 async def marketleaderboard(interaction: discord.Interaction):
     """Show the top 10 investors ranked by balance + portfolio value."""
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    async with pool.acquire() as db:
         rows = await db.fetch("""
         SELECT u.user_id, u.wealth_role,
                u.balance + COALESCE(SUM(h.shares * s.price), 0) AS net_worth
@@ -1138,7 +1561,7 @@ async def marketleaderboard(interaction: discord.Interaction):
         GROUP BY u.user_id, u.balance, u.wealth_role
         ORDER BY net_worth DESC
         LIMIT 10;
-        """, interaction.guild.id)
+        """, guild_id)
     if not rows:
         await send_embed(interaction, "🏦 Market Leaderboard", "No investors yet.", discord.Color.gold())
         return
@@ -1151,9 +1574,8 @@ async def marketleaderboard(interaction: discord.Interaction):
         role_tag = f" _{r['wealth_role']}_" if r["wealth_role"] else ""
         desc += f"{medal} **{name}**{role_tag} — `{money(r['net_worth'])}`\n"
     embed = discord.Embed(title="🏦 Market Leaderboard — Top Investors", description=desc, color=discord.Color.gold())
-    embed.set_footer(text="Ranked by balance + portfolio value")
+    embed.set_footer(text=f"Ranked by balance + portfolio value • {mode_label(guild_id)}")
     await interaction.response.send_message(embed=embed)
-
 
 
 @bot.tree.command(name="shop", description="Browse the EAS investor shop.")
@@ -1164,8 +1586,10 @@ async def shop(interaction: discord.Interaction, page: int = 1):
     Items are loaded from market_shop_items.  Users can buy items with /buy
     (future Phase 2 command); this command is read-only browsing.
     """
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
         total_items = await db.fetchval("SELECT COUNT(*) FROM market_shop_items;")
         items_per_page = 5
         total_pages = max(1, math.ceil(total_items / items_per_page))
@@ -1201,22 +1625,32 @@ async def shop(interaction: discord.Interaction, page: int = 1):
 
 @bot.tree.command(name="topstocks", description="View highest priced top 10 stocks.")
 async def topstocks(interaction: discord.Interaction):
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
-        rows = await db.fetch("SELECT * FROM market_stocks WHERE guild_id=$1 AND active=true ORDER BY price DESC LIMIT 10;", interaction.guild.id)
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    async with pool.acquire() as db:
+        rows = await db.fetch(
+            "SELECT * FROM market_stocks WHERE guild_id=$1 AND active=true ORDER BY price DESC LIMIT 10;",
+            guild_id,
+        )
     desc = ""
     for i, r in enumerate(rows, start=1):
-        member = interaction.guild.get_member(int(r["player_id"]))
-        name = member.display_name if member else f"User {r['player_id']}"
+        player_id = int(r["player_id"])
+        if 9000000001 <= player_id <= 9000000010:
+            fake = next((p for p in FAKE_PLAYERS if p["user_id"] == player_id), None)
+            name = fake["name"] if fake else f"Test Player {player_id}"
+        else:
+            member = interaction.guild.get_member(player_id)
+            name = member.display_name if member else f"User {player_id}"
         desc += f"**#{i} {name}** — `{money(r['price'])}` | Top 10 Place: `{r['rank_position']}`\n"
     await send_embed(interaction, "💹 Top Stocks", desc or "No stocks listed.", discord.Color.green())
 
 
-async def movement_board(guild_id: int, positive: bool):
-    assert db_pool is not None
+async def movement_board(guild_id: int, positive: bool, pool: asyncpg.Pool):
     op = ">" if positive else "<"
     order = "DESC" if positive else "ASC"
-    async with db_pool.acquire() as db:
+    async with pool.acquire() as db:
         return await db.fetch(f"""
         SELECT player_id, old_price, new_price, reason
         FROM market_stock_history
@@ -1228,41 +1662,67 @@ async def movement_board(guild_id: int, positive: bool):
 
 @bot.tree.command(name="gainers", description="View recent biggest gaining stocks.")
 async def gainers(interaction: discord.Interaction):
-    rows = await movement_board(interaction.guild.id, True)
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    rows = await movement_board(guild_id, True, pool)
     desc = ""
     for r in rows:
-        member = interaction.guild.get_member(int(r["player_id"]))
-        name = member.display_name if member else f"User {r['player_id']}"
+        player_id = int(r["player_id"])
+        if 9000000001 <= player_id <= 9000000010:
+            fake = next((p for p in FAKE_PLAYERS if p["user_id"] == player_id), None)
+            name = fake["name"] if fake else f"Test Player {player_id}"
+        else:
+            member = interaction.guild.get_member(player_id)
+            name = member.display_name if member else f"User {player_id}"
         desc += f"**{name}** `{r['new_price'] - r['old_price']:+,} SP` — {r['reason']}\n"
     await send_embed(interaction, "📈 Biggest Gainers", desc or "No gainers yet.", discord.Color.green())
 
 
 @bot.tree.command(name="losers", description="View recent biggest losing stocks.")
 async def losers(interaction: discord.Interaction):
-    rows = await movement_board(interaction.guild.id, False)
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    rows = await movement_board(guild_id, False, pool)
     desc = ""
     for r in rows:
-        member = interaction.guild.get_member(int(r["player_id"]))
-        name = member.display_name if member else f"User {r['player_id']}"
+        player_id = int(r["player_id"])
+        if 9000000001 <= player_id <= 9000000010:
+            fake = next((p for p in FAKE_PLAYERS if p["user_id"] == player_id), None)
+            name = fake["name"] if fake else f"Test Player {player_id}"
+        else:
+            member = interaction.guild.get_member(player_id)
+            name = member.display_name if member else f"User {player_id}"
         desc += f"**{name}** `{r['new_price'] - r['old_price']:+,} SP` — {r['reason']}\n"
     await send_embed(interaction, "📉 Biggest Losers", desc or "No losers yet.", discord.Color.red())
 
 
 @bot.tree.command(name="transactions", description="View your recent market transactions.")
 async def transactions(interaction: discord.Interaction):
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    async with pool.acquire() as db:
         rows = await db.fetch("""
         SELECT * FROM market_transactions
         WHERE guild_id=$1 AND investor_id=$2
         ORDER BY created_at DESC LIMIT 10;
-        """, interaction.guild.id, interaction.user.id)
+        """, guild_id, interaction.user.id)
     desc = ""
     for r in rows:
         target = ""
         if r["player_id"]:
-            member = interaction.guild.get_member(int(r["player_id"]))
-            target = f" {member.display_name if member else r['player_id']}"
+            player_id = int(r["player_id"])
+            if 9000000001 <= player_id <= 9000000010:
+                fake = next((p for p in FAKE_PLAYERS if p["user_id"] == player_id), None)
+                target = f" {fake['name'] if fake else f'Test Player {player_id}'}"
+            else:
+                member = interaction.guild.get_member(player_id)
+                target = f" {member.display_name if member else player_id}"
         shares = f" x{r['shares']}" if r["shares"] else ""
         total = money(r["total"] or 0)
         desc += f"`{r['type']}`{target}{shares} — **{total}**\n"
@@ -1273,6 +1733,13 @@ async def transactions(interaction: discord.Interaction):
 async def syncmarket(interaction: discord.Interaction):
     if not is_staff(interaction.user):
         await send_embed(interaction, "❌ No Permission", "Staff only.", discord.Color.red(), True); return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    if guild_id == TEST_GUILD_ID:
+        await send_embed(interaction, "⚠️ Test Server", "Use `/marketsimulate` to advance the simulation in the test server.", discord.Color.orange(), True)
+        return
     count = await sync_top10_for_guild(interaction.guild)
     await send_embed(interaction, "✅ Market Synced", f"Updated **{count}** top 10 market stocks from the ranked database.", discord.Color.green())
 
@@ -1281,9 +1748,14 @@ async def syncmarket(interaction: discord.Interaction):
 async def marketopen(interaction: discord.Interaction):
     if not is_staff(interaction.user):
         await send_embed(interaction, "❌ No Permission", "Staff only.", discord.Color.red(), True); return
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
-        await db.execute("INSERT INTO market_settings (guild_id, market_open) VALUES ($1,true) ON CONFLICT (guild_id) DO UPDATE SET market_open=true, updated_at=NOW();", interaction.guild.id)
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        await db.execute(
+            "INSERT INTO market_settings (guild_id, market_open) VALUES ($1,true) ON CONFLICT (guild_id) DO UPDATE SET market_open=true, updated_at=NOW();",
+            interaction.guild.id,
+        )
     await send_embed(interaction, "🔓 Market Open", "Trading is now open.", discord.Color.green())
 
 
@@ -1291,9 +1763,14 @@ async def marketopen(interaction: discord.Interaction):
 async def marketclose(interaction: discord.Interaction):
     if not is_staff(interaction.user):
         await send_embed(interaction, "❌ No Permission", "Staff only.", discord.Color.red(), True); return
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
-        await db.execute("INSERT INTO market_settings (guild_id, market_open) VALUES ($1,false) ON CONFLICT (guild_id) DO UPDATE SET market_open=false, updated_at=NOW();", interaction.guild.id)
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    async with pool.acquire() as db:
+        await db.execute(
+            "INSERT INTO market_settings (guild_id, market_open) VALUES ($1,false) ON CONFLICT (guild_id) DO UPDATE SET market_open=false, updated_at=NOW();",
+            interaction.guild.id,
+        )
     await send_embed(interaction, "🔒 Market Closed", "Trading is now closed.", discord.Color.red())
 
 
@@ -1302,10 +1779,14 @@ async def marketclose(interaction: discord.Interaction):
 async def logresult(interaction: discord.Interaction, user: discord.Member, result: str, mvp: bool = False, high_kills: bool = False, upset: bool = False):
     if not is_staff(interaction.user):
         await send_embed(interaction, "❌ No Permission", "Staff only.", discord.Color.red(), True); return
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
     result = result.lower().strip()
     if result not in {"win", "loss"}:
         await send_embed(interaction, "❌ Invalid Result", "Use `win` or `loss`.", discord.Color.red(), True); return
-    stock_row = await get_stock(interaction.guild.id, user.id)
+    stock_row = await get_stock(guild_id, user.id, pool)
     if not stock_row:
         await send_embed(interaction, "❌ Not Listed", "That player is not in the top 10 market.", discord.Color.red(), True); return
     pct = result_percent(result == "win", mvp, high_kills, upset)
@@ -1315,13 +1796,12 @@ async def logresult(interaction: discord.Interaction, user: discord.Member, resu
     if mvp: reason += ", MVP"
     if high_kills: reason += ", High Kills"
     if upset: reason += ", Upset"
-    old_price, new_price = await update_price(interaction.guild.id, user.id, new, reason)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+    old_price, new_price = await update_price(guild_id, user.id, new, reason, pool)
+    async with pool.acquire() as db:
         if result == "win":
-            await db.execute("UPDATE market_stocks SET wins=wins+1, streak=streak+1, mvps=mvps+$1 WHERE guild_id=$2 AND player_id=$3;", 1 if mvp else 0, interaction.guild.id, user.id)
+            await db.execute("UPDATE market_stocks SET wins=wins+1, streak=streak+1, mvps=mvps+$1 WHERE guild_id=$2 AND player_id=$3;", 1 if mvp else 0, guild_id, user.id)
         else:
-            await db.execute("UPDATE market_stocks SET losses=losses+1, streak=0, mvps=mvps+$1 WHERE guild_id=$2 AND player_id=$3;", 1 if mvp else 0, interaction.guild.id, user.id)
+            await db.execute("UPDATE market_stocks SET losses=losses+1, streak=0, mvps=mvps+$1 WHERE guild_id=$2 AND player_id=$3;", 1 if mvp else 0, guild_id, user.id)
     diff = new_price - old_price
     await send_embed(interaction, "📊 Stock Updated", f"**{user.display_name}**\nOld: `{money(old_price)}`\nNew: `{money(new_price)}`\nChange: `{diff:+,} SP`\nReason: **{reason}**", discord.Color.green() if diff >= 0 else discord.Color.red())
 
@@ -1331,9 +1811,11 @@ async def freezeportfolio(interaction: discord.Interaction, user: discord.Member
     """Log a portfolio freeze action in the transaction history."""
     if not is_staff(interaction.user):
         await send_embed(interaction, "❌ No Permission", "Staff only.", discord.Color.red(), True); return
-    await ensure_user(interaction.guild.id, user.id)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    await ensure_user(interaction.guild.id, user.id, pool)
+    async with pool.acquire() as db:
         await db.execute(
             "INSERT INTO market_transactions (guild_id, investor_id, type, total) VALUES ($1,$2,'staff_freeze',0);",
             interaction.guild.id, user.id,
@@ -1346,9 +1828,11 @@ async def unfreezeportfolio(interaction: discord.Interaction, user: discord.Memb
     """Log a portfolio unfreeze action in the transaction history."""
     if not is_staff(interaction.user):
         await send_embed(interaction, "❌ No Permission", "Staff only.", discord.Color.red(), True); return
-    await ensure_user(interaction.guild.id, user.id)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    await ensure_user(interaction.guild.id, user.id, pool)
+    async with pool.acquire() as db:
         await db.execute(
             "INSERT INTO market_transactions (guild_id, investor_id, type, total) VALUES ($1,$2,'staff_unfreeze',0);",
             interaction.guild.id, user.id,
@@ -1362,11 +1846,14 @@ async def givepoints(interaction: discord.Interaction, user: discord.Member, amo
         await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True); return
     if amount <= 0:
         await send_embed(interaction, "❌ Invalid Amount", "Amount must be more than 0.", discord.Color.red(), True); return
-    await ensure_user(interaction.guild.id, user.id)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
-        await db.execute("UPDATE market_users SET balance=balance+$1 WHERE guild_id=$2 AND user_id=$3;", amount, interaction.guild.id, user.id)
-        await db.execute("INSERT INTO market_transactions (guild_id,investor_id,type,total) VALUES ($1,$2,'developer_give',$3);", interaction.guild.id, user.id, amount)
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    await ensure_user(guild_id, user.id, pool)
+    async with pool.acquire() as db:
+        await db.execute("UPDATE market_users SET balance=balance+$1 WHERE guild_id=$2 AND user_id=$3;", amount, guild_id, user.id)
+        await db.execute("INSERT INTO market_transactions (guild_id,investor_id,type,total) VALUES ($1,$2,'developer_give',$3);", guild_id, user.id, amount)
     await send_embed(interaction, "✅ StarPoints Given", f"Gave **{money(amount)}** to {user.mention}.", discord.Color.green())
 
 
@@ -1376,11 +1863,14 @@ async def takepoints(interaction: discord.Interaction, user: discord.Member, amo
         await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True); return
     if amount <= 0:
         await send_embed(interaction, "❌ Invalid Amount", "Amount must be more than 0.", discord.Color.red(), True); return
-    await ensure_user(interaction.guild.id, user.id)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
-        await db.execute("UPDATE market_users SET balance=GREATEST(balance-$1,0) WHERE guild_id=$2 AND user_id=$3;", amount, interaction.guild.id, user.id)
-        await db.execute("INSERT INTO market_transactions (guild_id,investor_id,type,total) VALUES ($1,$2,'developer_take',$3);", interaction.guild.id, user.id, amount)
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    await ensure_user(guild_id, user.id, pool)
+    async with pool.acquire() as db:
+        await db.execute("UPDATE market_users SET balance=GREATEST(balance-$1,0) WHERE guild_id=$2 AND user_id=$3;", amount, guild_id, user.id)
+        await db.execute("INSERT INTO market_transactions (guild_id,investor_id,type,total) VALUES ($1,$2,'developer_take',$3);", guild_id, user.id, amount)
     await send_embed(interaction, "✅ StarPoints Taken", f"Took **{money(amount)}** from {user.mention}.", discord.Color.orange())
 
 
@@ -1390,12 +1880,154 @@ async def resetbalance(interaction: discord.Interaction, user: discord.Member, a
         await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True); return
     if amount < 0:
         await send_embed(interaction, "❌ Invalid Amount", "Amount cannot be negative.", discord.Color.red(), True); return
-    await ensure_user(interaction.guild.id, user.id)
-    assert db_pool is not None
-    async with db_pool.acquire() as db:
-        await db.execute("UPDATE market_users SET balance=$1 WHERE guild_id=$2 AND user_id=$3;", amount, interaction.guild.id, user.id)
-        await db.execute("INSERT INTO market_transactions (guild_id,investor_id,type,total) VALUES ($1,$2,'developer_reset',$3);", interaction.guild.id, user.id, amount)
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    await ensure_user(guild_id, user.id, pool)
+    async with pool.acquire() as db:
+        await db.execute("UPDATE market_users SET balance=$1 WHERE guild_id=$2 AND user_id=$3;", amount, guild_id, user.id)
+        await db.execute("INSERT INTO market_transactions (guild_id,investor_id,type,total) VALUES ($1,$2,'developer_reset',$3);", guild_id, user.id, amount)
     await send_embed(interaction, "✅ Balance Reset", f"Set {user.mention}'s balance to **{money(amount)}**.", discord.Color.green())
+
+
+# ---------------------------------------------------------------------------
+# New developer commands: /marketsimulate, /marketresettest, /marketstatus
+# ---------------------------------------------------------------------------
+
+@bot.tree.command(name="marketsimulate", description="Developer: Manually trigger market simulation (test server only).")
+async def marketsimulate(interaction: discord.Interaction):
+    """Advance fake player CRs and update stock prices in the test server."""
+    if not is_developer(interaction.user):
+        await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True); return
+    if interaction.guild is None or interaction.guild.id != TEST_GUILD_ID:
+        await send_embed(interaction, "❌ Test Server Only", "This command only works in the test server.", discord.Color.red(), True); return
+    if db_manager.db_pool_test is None:
+        await send_embed(interaction, "❌ Test DB Unavailable", "The test database is not connected.", discord.Color.red(), True); return
+
+    await interaction.response.defer()
+    try:
+        results = await simulate_market_movement(db_manager.db_pool_test)
+    except Exception as exc:
+        await interaction.followup.send(embed=discord.Embed(
+            title="❌ Simulation Error",
+            description=str(exc),
+            color=discord.Color.red(),
+        ))
+        return
+
+    if not results:
+        await interaction.followup.send(embed=discord.Embed(
+            title="⚠️ No Simulation Data",
+            description="No fake players found. Run `/marketresettest` to seed them.",
+            color=discord.Color.orange(),
+        ))
+        return
+
+    desc = "**🧪 TEST MODE — Simulation Results**\n\n"
+    for r in results:
+        fake = next((p for p in FAKE_PLAYERS if p["user_id"] == r["player_id"]), None)
+        name = fake["name"] if fake else f"Player {r['player_id']}"
+        diff = r["new_price"] - r["old_price"]
+        sign = "+" if diff >= 0 else ""
+        pos_change = ""
+        if r["old_position"] != r["new_position"]:
+            pos_change = f" (#{r['old_position']}→#{r['new_position']})"
+        desc += f"**{name}**{pos_change}: `{sign}{diff:,} SP` → `{money(r['new_price'])}`\n"
+
+    embed = discord.Embed(title="🧪 Market Simulation Complete", description=desc[:3900], color=discord.Color.teal())
+    embed.set_footer(text=f"Simulated {len(results)} fake players")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="marketresettest", description="Developer: Reset the test database to initial state.")
+async def marketresettest(interaction: discord.Interaction):
+    """Clear all test-server market data and re-seed fake players."""
+    if not is_developer(interaction.user):
+        await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True); return
+    if interaction.guild is None or interaction.guild.id != TEST_GUILD_ID:
+        await send_embed(interaction, "❌ Test Server Only", "This command only works in the test server.", discord.Color.red(), True); return
+    if db_manager.db_pool_test is None:
+        await send_embed(interaction, "❌ Test DB Unavailable", "The test database is not connected.", discord.Color.red(), True); return
+
+    await interaction.response.defer()
+    try:
+        await reset_test_database(db_manager.db_pool_test)
+    except Exception as exc:
+        await interaction.followup.send(embed=discord.Embed(
+            title="❌ Reset Error",
+            description=str(exc),
+            color=discord.Color.red(),
+        ))
+        return
+
+    desc = (
+        "✅ Test database has been reset.\n\n"
+        f"**Fake players re-seeded:** {len(FAKE_PLAYERS)}\n"
+        "**User balances cleared:** Yes\n"
+        "**Holdings cleared:** Yes\n"
+        "**Transaction history cleared:** Yes\n"
+        "**Price history cleared:** Yes"
+    )
+    embed = discord.Embed(title="🔄 Test Database Reset", description=desc, color=discord.Color.green())
+    embed.set_footer(text="🧪 TEST MODE")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="marketstatus", description="Show current database and market status.")
+async def marketstatus(interaction: discord.Interaction):
+    """Show mode, database connection status, active stocks, users, and last sync."""
+    guild_id = interaction.guild.id if interaction.guild else 0
+    current_mode = mode_label(guild_id) if validate_guild(guild_id) else "⚠️ Unknown Server"
+
+    # Check both pools.
+    async def _check(pool: Optional[asyncpg.Pool]) -> str:
+        if pool is None:
+            return "❌ Not connected"
+        try:
+            async with pool.acquire() as c:
+                await c.fetchval("SELECT 1")
+            return "✅ Connected"
+        except Exception:
+            return "⚠️ Error"
+
+    main_status = await _check(db_manager.db_pool_main)
+    test_status = await _check(db_manager.db_pool_test)
+
+    # Fetch stats from the guild's own pool (if available).
+    active_stocks = 0
+    user_count = 0
+    last_sync: Optional[str] = None
+
+    if validate_guild(guild_id):
+        try:
+            pool = await db_manager.get_pool(guild_id)
+            async with pool.acquire() as db:
+                active_stocks = safe_int(await db.fetchval(
+                    "SELECT COUNT(*) FROM market_stocks WHERE guild_id=$1 AND active=true;", guild_id
+                ))
+                user_count = safe_int(await db.fetchval(
+                    "SELECT COUNT(*) FROM market_users WHERE guild_id=$1;", guild_id
+                ))
+                last_ts = await db.fetchval(
+                    "SELECT MAX(updated_at) FROM market_stocks WHERE guild_id=$1;", guild_id
+                )
+                if last_ts:
+                    last_sync = last_ts.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            pass
+
+    desc = (
+        f"**Mode:** {current_mode}\n"
+        f"**Main DB:** {main_status}\n"
+        f"**Test DB:** {test_status}\n"
+        f"**Active Stocks:** {active_stocks}\n"
+        f"**Registered Users:** {user_count}\n"
+        f"**Last Sync:** {last_sync or 'Never'}"
+    )
+    embed = discord.Embed(title="📊 Market Status", description=desc, color=discord.Color.blurple())
+    embed.set_footer(text=f"Guild: {interaction.guild.name if interaction.guild else 'DM'}")
+    await interaction.response.send_message(embed=embed)
 
 
 if __name__ == "__main__":
