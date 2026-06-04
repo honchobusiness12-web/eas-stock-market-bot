@@ -150,6 +150,57 @@ WEALTH_ROLES: List[Tuple[str, int]] = [
     ("Millionaire",          10_000_000),
 ]
 
+TERMS_AND_CONDITIONS = """
+**EAS STOCK MARKET — TERMS & CONDITIONS**
+
+By registering for the EAS Stock Market, you agree to the following terms:
+
+**1. PARTICIPATION**
+You acknowledge that you are voluntarily participating in the EAS Stock Market economy. This is a simulated market for entertainment purposes only.
+
+**2. NO REAL VALUE**
+StarPoints (SP) have no real-world monetary value. They cannot be converted to real currency, traded outside this bot, or used for any real-world transactions.
+
+**3. MARKET VOLATILITY**
+Stock prices fluctuate based on player performance. You understand that:
+- Prices can increase or decrease at any time
+- Your investments may lose value
+- Past performance does not guarantee future results
+- Market conditions can change rapidly
+
+**4. ACCOUNT RESPONSIBILITY**
+You are responsible for:
+- Keeping your Discord account secure
+- All transactions made on your account
+- Compliance with Discord Terms of Service
+- Following all server rules and guidelines
+
+**5. STAFF AUTHORITY**
+Server staff and administrators have the authority to:
+- Suspend or ban users from the market
+- Reverse transactions if fraud is detected
+- Modify market rules with notice
+- Enforce compliance with these terms
+
+**6. NO GUARANTEES**
+The market is provided "as-is" without warranties. We do not guarantee:
+- Continuous availability
+- Data preservation
+- Specific market conditions
+- Compensation for losses
+
+**7. DISPUTE RESOLUTION**
+Disputes will be resolved by server staff. Their decision is final.
+
+**8. RULE CHANGES**
+These terms may be updated at any time. Continued participation constitutes acceptance of new terms.
+
+**9. COMPLIANCE**
+You agree to comply with all Discord Terms of Service and server rules while using the market.
+
+By clicking **Accept**, you acknowledge that you have read, understood, and agree to these terms.
+"""
+
 # Default shop catalogue — seeded into market_shop_items on first startup.
 DEFAULT_SHOP_ITEMS: List[Dict[str, Any]] = [
     {"item_name": "Bronze Investor Badge",   "description": "A bronze badge for dedicated investors.",          "price":    250_000, "category": "badge"},
@@ -544,7 +595,24 @@ async def _create_market_tables(pool: asyncpg.Pool, mode: str) -> None:
         else:
             print(f"[Shop/{mode}] ✅ Shop items already present — no seeding needed.")
 
+        # ------------------------------------------------------------------ #
+        # market_registrations — user registration and T&C acceptance.
+        # ------------------------------------------------------------------ #
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS market_registrations (
+            id            SERIAL PRIMARY KEY,
+            guild_id      BIGINT NOT NULL,
+            user_id       BIGINT NOT NULL,
+            username      TEXT NOT NULL,
+            accepted_terms BOOLEAN NOT NULL DEFAULT FALSE,
+            accepted_at   TIMESTAMP,
+            registered_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(guild_id, user_id)
+        );
+        """)
+
     print(f"[DB/{mode}] ✅ All market_ tables verified/created.")
+    print(f"[DB/{mode}] ✅ Registration table verified/created.")
 
 
 async def seed_fake_players(test_pool: asyncpg.Pool) -> None:
@@ -1075,6 +1143,138 @@ async def send_embed(interaction: discord.Interaction, title: str, description: 
     await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
 
 
+# ---------------------------------------------------------------------------
+# Registration helpers
+# ---------------------------------------------------------------------------
+
+async def is_registered(guild_id: int, user_id: int, pool: asyncpg.Pool) -> bool:
+    """Check if user is registered and has accepted terms in this guild."""
+    async with pool.acquire() as db:
+        result = await db.fetchval(
+            "SELECT accepted_terms FROM market_registrations WHERE guild_id=$1 AND user_id=$2;",
+            guild_id, user_id,
+        )
+    return result is True
+
+
+async def get_registration_info(guild_id: int, user_id: int, pool: asyncpg.Pool) -> Optional[Dict]:
+    """Get user's registration info."""
+    async with pool.acquire() as db:
+        return await db.fetchrow(
+            "SELECT * FROM market_registrations WHERE guild_id=$1 AND user_id=$2;",
+            guild_id, user_id,
+        )
+
+
+NOT_REGISTERED_DESC = (
+    "You must register for the EAS Stock Market first.\n\n"
+    "Use `/register` to:\n"
+    "✓ Read the Terms & Conditions\n"
+    "✓ Accept the agreement\n"
+    f"✓ Get your starting balance of ${STARTING_SP:,} SP\n\n"
+    "Registration takes less than 1 minute!"
+)
+
+
+# ---------------------------------------------------------------------------
+# Registration UI — Accept / Decline buttons
+# ---------------------------------------------------------------------------
+
+class RegistrationView(discord.ui.View):
+    """View with Accept and Decline buttons for the /register command."""
+
+    def __init__(self, user_id: int, guild_id: int, pool: asyncpg.Pool, username: str):
+        super().__init__(timeout=300)  # 5-minute timeout
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.pool = pool
+        self.username = username
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Only the user who invoked /register may click the buttons."""
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "These buttons are not for you.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.green)
+    async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Register the user and create their market account."""
+        try:
+            async with self.pool.acquire() as db:
+                await db.execute(
+                    """
+                    INSERT INTO market_registrations
+                        (guild_id, user_id, username, accepted_terms, accepted_at)
+                    VALUES ($1, $2, $3, TRUE, NOW())
+                    ON CONFLICT (guild_id, user_id)
+                    DO UPDATE SET accepted_terms=TRUE, accepted_at=NOW(), username=$3;
+                    """,
+                    self.guild_id, self.user_id, self.username,
+                )
+            # Create market_users entry with starting balance.
+            await ensure_user(self.guild_id, self.user_id, self.pool)
+        except Exception as exc:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="❌ Registration Error",
+                    description=f"An error occurred: {exc}",
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # Disable all buttons.
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(view=self)
+
+        desc = (
+            "You have been registered and accepted the Terms & Conditions.\n\n"
+            f"**Your Starting Balance:** ${STARTING_SP:,} SP\n\n"
+            "You can now use all market commands:\n"
+            "• `/balance` — Check your balance\n"
+            "• `/daily` — Claim daily rewards\n"
+            "• `/market` — View the Top 10\n"
+            "• `/buy` — Purchase stocks\n"
+            "• `/sell` — Sell stocks\n"
+            "• `/portfolio` — View your holdings\n\n"
+            "Good luck! 📈"
+        )
+        embed = discord.Embed(
+            title="✅ Welcome to the EAS Stock Market!",
+            description=desc,
+            color=discord.Color.green(),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.red)
+    async def decline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Decline registration — do not register the user."""
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        await interaction.response.edit_message(view=self)
+
+        desc = (
+            "You have declined the Terms & Conditions.\n\n"
+            "You can register at any time by using `/register` again."
+        )
+        embed = discord.Embed(
+            title="ℹ️ Registration Declined",
+            description=desc,
+            color=discord.Color.orange(),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def on_timeout(self) -> None:
+        """Disable buttons when the view times out."""
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+
+
 async def validate_guild_and_get_pool(interaction: discord.Interaction) -> Optional[asyncpg.Pool]:
     """Validate that the interaction comes from a known guild and return its pool.
 
@@ -1161,12 +1361,14 @@ async def marketcommands(interaction: discord.Interaction, page: int = 1):
     pages = {
         1: (
             "📘 Economy Commands",
+            "`/register` — Accept Terms & Conditions and register\n"
             "`/ping` — Bot status, latency & uptime\n"
             "`/balance` — View your SP balance & wealth role\n"
             "`/daily` — Claim your daily $50,000 SP reward\n"
             "`/marketcommands` — This command list\n\n"
             "**Starting Balance:** $250,000 SP\n"
-            "**Daily Reward:** $50,000 SP",
+            "**Daily Reward:** $50,000 SP\n\n"
+            "**Note:** All market commands require registration via `/register`",
         ),
         2: (
             "📈 Market Commands",
@@ -1212,6 +1414,50 @@ async def marketcommands(interaction: discord.Interaction, page: int = 1):
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="register", description="Register for the EAS Stock Market and accept the Terms & Conditions.")
+async def register(interaction: discord.Interaction):
+    """Display Terms & Conditions and allow user to register for the market."""
+    pool = await validate_guild_and_get_pool(interaction)
+    if pool is None:
+        return
+    guild_id = interaction.guild.id
+    user_id = interaction.user.id
+
+    # Check if already registered.
+    reg = await get_registration_info(guild_id, user_id, pool)
+    if reg and reg["accepted_terms"]:
+        reg_date = reg["registered_at"]
+        date_str = reg_date.strftime("%Y-%m-%d at %H:%M UTC") if reg_date else "Unknown"
+        desc = (
+            f"You registered on: **{date_str}**\n\n"
+            "You have already accepted the Terms & Conditions.\n"
+            "Use `/balance` to check your account status."
+        )
+        await send_embed(
+            interaction,
+            "ℹ️ Already Registered",
+            desc,
+            discord.Color.blue(),
+            True,
+        )
+        return
+
+    # Show T&C embed with Accept/Decline buttons.
+    embed = discord.Embed(
+        title="📋 EAS Stock Market — Registration",
+        description=TERMS_AND_CONDITIONS,
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text="You have 5 minutes to accept or decline. Only you can click these buttons.")
+    view = RegistrationView(
+        user_id=user_id,
+        guild_id=guild_id,
+        pool=pool,
+        username=str(interaction.user),
+    )
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 @bot.tree.command(name="balance", description="View your StarPoints balance and wealth role.")
 async def balance(interaction: discord.Interaction):
     """Show the caller's current balance, wealth role, and next wealth milestone."""
@@ -1219,6 +1465,9 @@ async def balance(interaction: discord.Interaction):
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     await ensure_user(guild_id, interaction.user.id, pool)
     async with pool.acquire() as db:
         row = await db.fetchrow(
@@ -1258,6 +1507,9 @@ async def daily(interaction: discord.Interaction):
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     await ensure_user(guild_id, interaction.user.id, pool)
     async with pool.acquire() as db:
         can_claim = await db.fetchval("""
@@ -1311,6 +1563,9 @@ async def market(interaction: discord.Interaction):
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     await sync_top10_for_guild(interaction.guild)
     async with pool.acquire() as db:
         rows = await db.fetch(
@@ -1345,6 +1600,9 @@ async def stock(interaction: discord.Interaction, user: discord.Member):
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     row = await get_stock(guild_id, user.id, pool)
     if not row:
         await send_embed(interaction, "❌ Not Listed", "That player is not currently in the top 10 market.", discord.Color.red(), True)
@@ -1379,6 +1637,9 @@ async def buy(interaction: discord.Interaction, user: discord.Member, shares: in
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     if not await market_is_open(guild_id, pool):
         await send_embed(interaction, "🔒 Market Closed", "Trading is currently closed.", discord.Color.red(), True); return
     if shares <= 0:
@@ -1448,6 +1709,9 @@ async def sell(interaction: discord.Interaction, user: discord.Member, shares: i
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     if not await market_is_open(guild_id, pool):
         await send_embed(interaction, "🔒 Market Closed", "Trading is currently closed.", discord.Color.red(), True); return
     if shares <= 0:
@@ -1503,6 +1767,9 @@ async def portfolio(interaction: discord.Interaction):
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     await ensure_user(guild_id, interaction.user.id, pool)
     async with pool.acquire() as db:
         bal = await db.fetchval(
@@ -1550,6 +1817,9 @@ async def marketleaderboard(interaction: discord.Interaction):
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     async with pool.acquire() as db:
         rows = await db.fetch("""
         SELECT u.user_id, u.wealth_role,
@@ -1588,6 +1858,10 @@ async def shop(interaction: discord.Interaction, page: int = 1):
     """
     pool = await validate_guild_and_get_pool(interaction)
     if pool is None:
+        return
+    guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
         return
     async with pool.acquire() as db:
         total_items = await db.fetchval("SELECT COUNT(*) FROM market_shop_items;")
@@ -1629,6 +1903,9 @@ async def topstocks(interaction: discord.Interaction):
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     async with pool.acquire() as db:
         rows = await db.fetch(
             "SELECT * FROM market_stocks WHERE guild_id=$1 AND active=true ORDER BY price DESC LIMIT 10;",
@@ -1666,6 +1943,9 @@ async def gainers(interaction: discord.Interaction):
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     rows = await movement_board(guild_id, True, pool)
     desc = ""
     for r in rows:
@@ -1686,6 +1966,9 @@ async def losers(interaction: discord.Interaction):
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     rows = await movement_board(guild_id, False, pool)
     desc = ""
     for r in rows:
@@ -1706,6 +1989,9 @@ async def transactions(interaction: discord.Interaction):
     if pool is None:
         return
     guild_id = interaction.guild.id
+    if not await is_registered(guild_id, interaction.user.id, pool):
+        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
+        return
     async with pool.acquire() as db:
         rows = await db.fetch("""
         SELECT * FROM market_transactions
