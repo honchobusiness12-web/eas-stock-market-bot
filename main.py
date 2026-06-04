@@ -237,6 +237,7 @@ bot_start_time: Optional[datetime.datetime] = None
 # Startup-once flags — prevent re-running seeding/registration on reconnects.
 _shop_seeded: bool = False
 _commands_registered: bool = False
+_badges_registered: bool = False
 
 
 def money(n: int) -> str:
@@ -660,9 +661,23 @@ async def _create_market_tables(pool: asyncpg.Pool, mode: str) -> None:
             category    TEXT NOT NULL DEFAULT 'market',
             rarity      TEXT NOT NULL DEFAULT 'common',
             icon_url    TEXT,
+            color       TEXT,
             visible     BOOLEAN NOT NULL DEFAULT TRUE,
             created_at  TIMESTAMP DEFAULT NOW()
         );
+        """)
+
+        # Non-destructive migration: add color column if missing.
+        await db.execute("""
+        DO $body$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name='badge_definitions' AND column_name='color'
+            ) THEN
+                ALTER TABLE badge_definitions ADD COLUMN color TEXT;
+            END IF;
+        END$body$;
         """)
 
         # ------------------------------------------------------------------ #
@@ -726,13 +741,14 @@ async def _create_market_tables(pool: asyncpg.Pool, mode: str) -> None:
                 badges_seeded = 0
                 for badge in badge_manifest:
                     result = await db.execute("""
-                    INSERT INTO badge_definitions (id, name, description, category, rarity, icon_url, visible)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    INSERT INTO badge_definitions (id, name, description, category, rarity, icon_url, color, visible)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     ON CONFLICT (id) DO UPDATE SET
-                        name=$2, description=$3, category=$4, rarity=$5, icon_url=$6, visible=$7;
+                        name=$2, description=$3, category=$4, rarity=$5, icon_url=$6, color=$7, visible=$8;
                     """, badge["id"], badge["name"], badge.get("description", ""),
                         badge.get("category", "market"), badge.get("rarity", "common"),
-                        badge.get("icon_url", ""), badge.get("visible", True))
+                        badge.get("icon_url", ""), badge.get("color"),
+                        badge.get("visible", True))
                     if result and "INSERT" in result:
                         badges_seeded += 1
                 print(f"[Badges/{mode}] ✅ Badge manifest synced ({len(badge_manifest)} badges).")
@@ -1233,6 +1249,136 @@ async def top10_sync_loop():
 
 
 # ---------------------------------------------------------------------------
+# register_badge_definitions — register all 10 badge definitions to the DB
+# ---------------------------------------------------------------------------
+
+BADGE_DEFINITIONS: List[Dict[str, Any]] = [
+    {
+        "badge_id": "early_investor",
+        "name": "Early Investor Badge",
+        "description": "Awarded to the earliest supporters of the EAS market.",
+        "icon": "https://raw.githubusercontent.com/honchobusiness12-web/eas-stock-market-bot/main/early_investor.svg",
+        "color": "#6b7280",
+        "rarity": "common",
+    },
+    {
+        "badge_id": "rising_investor",
+        "name": "Rising Investor Badge",
+        "description": "For investors on the rise.",
+        "icon": "https://raw.githubusercontent.com/honchobusiness12-web/eas-stock-market-bot/main/rising_investor.svg",
+        "color": "#6b7280",
+        "rarity": "common",
+    },
+    {
+        "badge_id": "diamond_hands",
+        "name": "Diamond Hands Badge",
+        "description": "For investors who never sell.",
+        "icon": "https://raw.githubusercontent.com/honchobusiness12-web/eas-stock-market-bot/main/diamond_hands.svg",
+        "color": "#00d4ff",
+        "rarity": "rare",
+    },
+    {
+        "badge_id": "market_mogul_badge",
+        "name": "Market Mogul Badge",
+        "description": "For the most powerful market players.",
+        "icon": "https://raw.githubusercontent.com/honchobusiness12-web/eas-stock-market-bot/main/market_mogul.svg",
+        "color": "#00d4ff",
+        "rarity": "rare",
+    },
+    {
+        "badge_id": "stock_king",
+        "name": "Stock King Badge",
+        "description": "Reign supreme over the market.",
+        "icon": "https://raw.githubusercontent.com/honchobusiness12-web/eas-stock-market-bot/main/stock_king.svg",
+        "color": "#a855f7",
+        "rarity": "epic",
+    },
+    {
+        "badge_id": "bull_master",
+        "name": "Bull Master Badge",
+        "description": "Master of the bull market.",
+        "icon": "https://raw.githubusercontent.com/honchobusiness12-web/eas-stock-market-bot/main/bull_master.svg",
+        "color": "#a855f7",
+        "rarity": "epic",
+    },
+    {
+        "badge_id": "bear_master",
+        "name": "Bear Master Badge",
+        "description": "Master of the bear market.",
+        "icon": "https://raw.githubusercontent.com/honchobusiness12-web/eas-stock-market-bot/main/bear_master.svg",
+        "color": "#a855f7",
+        "rarity": "epic",
+    },
+    {
+        "badge_id": "hall_of_investors",
+        "name": "Hall of Investors Badge",
+        "description": "Inducted into the hall of legends.",
+        "icon": "https://raw.githubusercontent.com/honchobusiness12-web/eas-stock-market-bot/main/hall_of_investors.svg",
+        "color": "#ff6b6b",
+        "rarity": "legendary",
+    },
+    {
+        "badge_id": "starpoint_elite",
+        "name": "Starpoint Elite Badge",
+        "description": "The pinnacle of StarPoint achievement.",
+        "icon": "https://raw.githubusercontent.com/honchobusiness12-web/eas-stock-market-bot/main/starpoint_elite.svg",
+        "color": "#ff6b6b",
+        "rarity": "legendary",
+    },
+    {
+        "badge_id": "eas_tycoon_badge",
+        "name": "EAS Tycoon Badge",
+        "description": "The ultimate badge for the wealthiest investors.",
+        "icon": "https://raw.githubusercontent.com/honchobusiness12-web/eas-stock-market-bot/main/eas_tycoon.svg",
+        "color": "#ffd700",
+        "rarity": "mythic",
+    },
+]
+
+
+async def register_badge_definitions() -> int:
+    """Register all 10 badge definitions to the main database.
+
+    Uses badge_id as the unique key — checks if exists before inserting.
+    Returns the number of newly registered badges.
+    """
+    if db_manager.db_pool_main is None:
+        print("[Badges] ⚠️  Main database unavailable — skipping badge registration.")
+        return 0
+
+    registered_count = 0
+    async with db_manager.db_pool_main.acquire() as db:
+        for badge in BADGE_DEFINITIONS:
+            badge_id = badge["badge_id"]
+            # Check if badge already exists.
+            existing = await db.fetchval(
+                "SELECT id FROM badge_definitions WHERE id = $1;",
+                badge_id,
+            )
+            if existing is not None:
+                print(f"[Badges] ⏭️  Already registered: {badge_id}")
+                continue
+            await db.execute(
+                """
+                INSERT INTO badge_definitions (id, name, description, category, rarity, icon_url, color, visible)
+                VALUES ($1, $2, $3, 'market', $4, $5, $6, TRUE)
+                ON CONFLICT (id) DO NOTHING;
+                """,
+                badge_id,
+                badge["name"],
+                badge["description"],
+                badge["rarity"],
+                badge["icon"],
+                badge["color"],
+            )
+            print(f"[Badges] ✅ Registered: {badge_id} ({badge['name']})")
+            registered_count += 1
+
+    print(f"[Badges] 📋 Badge registration complete — {len(BADGE_DEFINITIONS)} total definitions, {registered_count} newly registered.")
+    return registered_count
+
+
+# ---------------------------------------------------------------------------
 # seed_market_shop_items — populate market_shop_items with the 26 catalogue items
 # ---------------------------------------------------------------------------
 
@@ -1246,9 +1392,12 @@ async def seed_market_shop_items() -> int:
         print("[Shop] ⚠️  Main database unavailable — skipping shop seeding.")
         return 0
 
-    # All 26 items: (item_name, description, category, price, rarity, is_limited, max_stock)
+    # All 26 items: (item_name, description, category, price, rarity, is_limited, max_stock,
+    #                badge_id, role_id_str)
     # is_limited=True  → limited stock; max_stock=None means unlimited.
     # resale_percent: 85 for limited/ultra-rare, 70 for everything else.
+    # badge_id: links to badge_definitions.id for badge category items.
+    # role_id_str: Discord role name key for role category items (resolved at purchase time).
     SHOP_CATALOGUE: List[Dict[str, Any]] = [
         # ── Website Badges (10) ──────────────────────────────────────────────
         {
@@ -1259,6 +1408,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "common",
             "is_limited": False,
             "max_stock": None,
+            "badge_id": "early_investor",
+            "role_id_str": None,
         },
         {
             "item_name": "rising_investor",
@@ -1268,6 +1419,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "common",
             "is_limited": False,
             "max_stock": None,
+            "badge_id": "rising_investor",
+            "role_id_str": None,
         },
         {
             "item_name": "diamond_hands",
@@ -1277,6 +1430,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "rare",
             "is_limited": True,
             "max_stock": 100,
+            "badge_id": "diamond_hands",
+            "role_id_str": None,
         },
         {
             "item_name": "market_mogul_badge",
@@ -1286,6 +1441,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "rare",
             "is_limited": True,
             "max_stock": 50,
+            "badge_id": "market_mogul_badge",
+            "role_id_str": None,
         },
         {
             "item_name": "stock_king",
@@ -1295,6 +1452,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "epic",
             "is_limited": True,
             "max_stock": 25,
+            "badge_id": "stock_king",
+            "role_id_str": None,
         },
         {
             "item_name": "bull_master",
@@ -1304,6 +1463,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "epic",
             "is_limited": True,
             "max_stock": 15,
+            "badge_id": "bull_master",
+            "role_id_str": None,
         },
         {
             "item_name": "bear_master",
@@ -1313,6 +1474,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "epic",
             "is_limited": True,
             "max_stock": 15,
+            "badge_id": "bear_master",
+            "role_id_str": None,
         },
         {
             "item_name": "hall_of_investors",
@@ -1322,6 +1485,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "legendary",
             "is_limited": True,
             "max_stock": 10,
+            "badge_id": "hall_of_investors",
+            "role_id_str": None,
         },
         {
             "item_name": "starpoint_elite",
@@ -1331,6 +1496,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "legendary",
             "is_limited": True,
             "max_stock": 10,
+            "badge_id": "starpoint_elite",
+            "role_id_str": None,
         },
         {
             "item_name": "eas_tycoon_badge",
@@ -1340,8 +1507,10 @@ async def seed_market_shop_items() -> int:
             "rarity": "mythic",
             "is_limited": True,
             "max_stock": 5,
+            "badge_id": "eas_tycoon_badge",
+            "role_id_str": None,
         },
-        # ── Discord Roles (6) ────────────────────────────────────────────────
+        # ── Discord Roles (11) ───────────────────────────────────────────────
         {
             "item_name": "millionaire_role",
             "description": "Millionaire Role — unlock the Millionaire Discord role.",
@@ -1350,6 +1519,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "common",
             "is_limited": False,
             "max_stock": None,
+            "badge_id": None,
+            "role_id_str": "millionaire_role",
         },
         {
             "item_name": "multi_millionaire_role",
@@ -1359,6 +1530,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "common",
             "is_limited": False,
             "max_stock": None,
+            "badge_id": None,
+            "role_id_str": "multi_millionaire_role",
         },
         {
             "item_name": "investor_elite_role",
@@ -1368,6 +1541,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "rare",
             "is_limited": True,
             "max_stock": 100,
+            "badge_id": None,
+            "role_id_str": "investor_elite_role",
         },
         {
             "item_name": "market_mogul_role",
@@ -1377,6 +1552,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "rare",
             "is_limited": True,
             "max_stock": 50,
+            "badge_id": None,
+            "role_id_str": "market_mogul_role",
         },
         {
             "item_name": "stock_legend_role",
@@ -1386,6 +1563,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "epic",
             "is_limited": True,
             "max_stock": 25,
+            "badge_id": None,
+            "role_id_str": "stock_legend_role",
         },
         {
             "item_name": "eas_tycoon_role",
@@ -1395,6 +1574,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "epic",
             "is_limited": True,
             "max_stock": 10,
+            "badge_id": None,
+            "role_id_str": "eas_tycoon_role",
         },
         # ── Ultra-Rare Roles (5) ─────────────────────────────────────────────
         {
@@ -1405,6 +1586,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "mythic",
             "is_limited": True,
             "max_stock": 5,
+            "badge_id": None,
+            "role_id_str": "market_shark_role",
         },
         {
             "item_name": "investment_bank_role",
@@ -1414,6 +1597,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "mythic",
             "is_limited": True,
             "max_stock": 3,
+            "badge_id": None,
+            "role_id_str": "investment_bank_role",
         },
         {
             "item_name": "global_investor_role",
@@ -1423,6 +1608,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "mythic",
             "is_limited": True,
             "max_stock": 2,
+            "badge_id": None,
+            "role_id_str": "global_investor_role",
         },
         {
             "item_name": "market_overlord_role",
@@ -1432,6 +1619,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "mythic",
             "is_limited": True,
             "max_stock": 1,
+            "badge_id": None,
+            "role_id_str": "market_overlord_role",
         },
         {
             "item_name": "stock_emperor_role",
@@ -1441,6 +1630,8 @@ async def seed_market_shop_items() -> int:
             "rarity": "mythic",
             "is_limited": True,
             "max_stock": 1,
+            "badge_id": None,
+            "role_id_str": "stock_emperor_role",
         },
     ]
 
@@ -1452,6 +1643,7 @@ async def seed_market_shop_items() -> int:
             is_limited = item["is_limited"]
             max_stock = item["max_stock"]
             rarity = item["rarity"]
+            badge_id = item.get("badge_id")
 
             # Check if item already exists.
             existing = await db.fetchval(
@@ -1459,6 +1651,12 @@ async def seed_market_shop_items() -> int:
                 item_name,
             )
             if existing is not None:
+                # Update badge_id if it's missing (backfill for existing rows).
+                if badge_id is not None:
+                    await db.execute(
+                        "UPDATE market_shop_items SET badge_id=$1 WHERE item_name=$2 AND badge_id IS NULL;",
+                        badge_id, item_name,
+                    )
                 print(f"[Shop] ⏭️  Already exists: {item_name}")
                 continue
 
@@ -1475,8 +1673,8 @@ async def seed_market_shop_items() -> int:
                     (item_name, description, price, category, rarity, active,
                      limited, max_stock, current_stock,
                      base_value, current_value, min_value, max_value,
-                     resale_percent, demand_score, total_bought, total_resold)
-                VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10,$11,$12,$13,0,0,0);
+                     resale_percent, badge_id, demand_score, total_bought, total_resold)
+                VALUES ($1,$2,$3,$4,$5,TRUE,$6,$7,$8,$9,$10,$11,$12,$13,$14,0,0,0);
                 """,
                 item_name,
                 item["description"],
@@ -1491,6 +1689,7 @@ async def seed_market_shop_items() -> int:
                 min_value,
                 max_value,
                 resale_percent,
+                badge_id,
             )
             print(f"[Shop] ✅ Seeded: {item_name} (${price:,})")
             seeded_count += 1
@@ -1548,7 +1747,7 @@ async def on_ready():
     slash commands to both servers.  Comprehensive startup logs are printed
     so Railway deployment logs are easy to read.
     """
-    global bot_start_time, db_pool, _shop_seeded, _commands_registered
+    global bot_start_time, db_pool, _shop_seeded, _commands_registered, _badges_registered
     bot_start_time = datetime.datetime.utcnow()
 
     print("=" * 60)
@@ -1600,6 +1799,16 @@ async def on_ready():
     else:
         print("[Shop] ℹ️  Shop seeding already ran — skipping.")
 
+    # Register badge definitions to the main database (once per process lifetime).
+    if not _badges_registered:
+        _badges_registered = True
+        try:
+            await register_badge_definitions()
+        except Exception as exc:
+            print(f"[Badges] ❌ Badge registration failed: {exc}")
+    else:
+        print("[Badges] ℹ️  Badge registration already ran — skipping.")
+
     # Register slash commands to the testing guild (once per process lifetime).
     if not _commands_registered:
         _commands_registered = True
@@ -1637,6 +1846,115 @@ async def on_ready():
 async def send_embed(interaction: discord.Interaction, title: str, description: str, color=discord.Color.blurple(), ephemeral=False):
     embed = discord.Embed(title=title, description=description, color=color)
     await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
+
+# ---------------------------------------------------------------------------
+# Badge and role purchase handlers
+# ---------------------------------------------------------------------------
+
+async def handle_badge_purchase(
+    guild_id: int,
+    user_id: int,
+    badge_id: str,
+    db_pool: asyncpg.Pool,
+) -> Tuple[bool, str]:
+    """Award a badge to a user in player_badges.
+
+    Returns (success, message) where success is True if the badge was awarded,
+    False if the user already has it or an error occurred.
+    """
+    async with db_pool.acquire() as db:
+        # Look up badge definition for the display name.
+        badge_def = await db.fetchrow(
+            "SELECT id, name FROM badge_definitions WHERE id = $1;",
+            badge_id,
+        )
+        if badge_def is None:
+            return False, f"Badge definition `{badge_id}` not found in the database."
+
+        # Check if user already has this badge.
+        already_has = await db.fetchval(
+            "SELECT id FROM player_badges WHERE guild_id=$1 AND user_id=$2 AND badge_id=$3;",
+            guild_id, user_id, badge_id,
+        )
+        if already_has is not None:
+            return False, f"You already have the **{badge_def['name']}** badge."
+
+        # Award the badge.
+        await db.execute(
+            """
+            INSERT INTO player_badges (guild_id, user_id, badge_id, awarded_at, source)
+            VALUES ($1, $2, $3, NOW(), 'shop')
+            ON CONFLICT (guild_id, user_id, badge_id) DO NOTHING;
+            """,
+            guild_id, user_id, badge_id,
+        )
+
+    return True, f"**{badge_def['name']}** has been added to your profile!"
+
+
+async def handle_role_purchase(
+    guild_id: int,
+    user_id: int,
+    role_name_key: str,
+    db_pool: asyncpg.Pool,
+) -> Tuple[bool, str]:
+    """Assign a Discord role to a member by searching for a role whose name
+    matches the role_name_key (case-insensitive, underscores treated as spaces).
+
+    Returns (success, message).
+    """
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return False, "Could not find the Discord server. Please try again."
+
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except Exception:
+            return False, "Could not find your Discord member profile."
+
+    # Normalise the key: replace underscores with spaces, strip trailing "_role".
+    normalised = role_name_key.replace("_", " ").strip()
+    if normalised.lower().endswith(" role"):
+        normalised = normalised[:-5].strip()
+
+    # Find the matching role in the guild (case-insensitive).
+    target_role: Optional[discord.Role] = None
+    for role in guild.roles:
+        if role.name.lower() == normalised.lower():
+            target_role = role
+            break
+    # Fallback: partial match.
+    if target_role is None:
+        for role in guild.roles:
+            if normalised.lower() in role.name.lower():
+                target_role = role
+                break
+
+    if target_role is None:
+        return False, (
+            f"Could not find a Discord role matching `{role_name_key}`. "
+            "Please ask a staff member to set up the role."
+        )
+
+    # Check if member already has the role.
+    if target_role in member.roles:
+        return False, f"You already have the **{target_role.name}** role."
+
+    # Assign the role.
+    try:
+        await member.add_roles(target_role, reason="Shop purchase")
+    except discord.Forbidden:
+        return False, (
+            f"I don't have permission to assign the **{target_role.name}** role. "
+            "Please ask a staff member to check my role permissions."
+        )
+    except Exception as exc:
+        return False, f"Failed to assign role: {exc}"
+
+    return True, f"The **{target_role.name}** role has been assigned to you!"
 
 
 # ---------------------------------------------------------------------------
@@ -2336,7 +2654,7 @@ async def shop(interaction: discord.Interaction, page: int = 1):
         description=desc.strip(),
         color=discord.Color.blue(),
     )
-    embed.set_footer(text=f"Page {page}/{total_pages} • Use /buyitem <ID> to purchase • /shop page:{page+1} for more")
+    embed.set_footer(text=f"Page {page}/{total_pages} • Use /buyitem <item_name> to purchase • /shop page:{page+1} for more")
     await interaction.response.send_message(embed=embed)
 
 
@@ -2935,11 +3253,12 @@ async def sellstarpoints(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
-# /inventory — View your purchased shop items
+# /inventory — View your purchased shop items, badges, and roles
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="inventory", description="View your purchased shop items.")
+@bot.tree.command(name="inventory", description="View your badges, roles, and purchased shop items.")
 async def inventory(interaction: discord.Interaction):
+    """Display all owned badges (from player_badges), Discord roles, and shop items."""
     pool = await validate_guild_and_get_pool(interaction)
     if pool is None:
         return
@@ -2947,38 +3266,108 @@ async def inventory(interaction: discord.Interaction):
     if not await is_registered(guild_id, interaction.user.id, pool):
         await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
         return
+
+    rarity_icons = {
+        "common": "⬜", "uncommon": "🟩", "rare": "🟦", "epic": "🟪",
+        "legendary": "🟨", "mythic": "🟥", "exclusive": "🔶",
+    }
+    category_icons = {"badge": "🏅", "title": "📛", "cosmetic": "🎨", "trophy": "🏆", "role": "👑"}
+
+    # ── Section 1: Badges from player_badges ─────────────────────────────
     async with pool.acquire() as db:
-        rows = await db.fetch("""
+        badge_rows = await db.fetch("""
+        SELECT pb.badge_id, pb.awarded_at, pb.source,
+               bd.name, bd.rarity, bd.icon_url, bd.color
+        FROM player_badges pb
+        JOIN badge_definitions bd ON pb.badge_id = bd.id
+        WHERE pb.guild_id=$1 AND pb.user_id=$2
+        ORDER BY pb.awarded_at DESC;
+        """, guild_id, interaction.user.id)
+
+        # ── Section 2: Shop items (non-badge, non-role) ───────────────────
+        shop_rows = await db.fetch("""
         SELECT ui.purchased_at, si.item_name, si.description, si.category, si.rarity
         FROM market_user_items ui
         JOIN market_shop_items si ON ui.item_id = si.id
         WHERE ui.guild_id=$1 AND ui.user_id=$2
         ORDER BY ui.purchased_at DESC;
         """, guild_id, interaction.user.id)
-    if not rows:
+
+    # ── Section 3: Discord roles ──────────────────────────────────────────
+    member = interaction.guild.get_member(interaction.user.id)
+    if member is None:
+        try:
+            member = await interaction.guild.fetch_member(interaction.user.id)
+        except Exception:
+            member = None
+
+    # Filter out @everyone and bot-managed roles.
+    discord_roles: List[discord.Role] = []
+    if member:
+        discord_roles = [
+            r for r in member.roles
+            if r.name != "@everyone" and not r.managed
+        ]
+        discord_roles.sort(key=lambda r: r.position, reverse=True)
+
+    total_items = len(badge_rows) + len(discord_roles) + len(shop_rows)
+
+    if total_items == 0:
         await send_embed(
             interaction, "🎒 Inventory",
-            "You have no items yet.\nVisit the `/shop` to browse available items!",
+            "You have no badges, roles, or items yet.\nVisit the `/shop` to browse available items!",
             discord.Color.blue(),
         )
         return
-    category_icons = {"badge": "🏅", "title": "📛", "cosmetic": "🎨", "trophy": "🏆"}
-    rarity_colors = {"common": "⬜", "uncommon": "🟩", "rare": "🟦", "epic": "🟪", "legendary": "🟨", "mythic": "🟥", "exclusive": "🔶"}
-    desc = ""
-    for r in rows:
-        icon = category_icons.get(r["category"], "🛍️")
-        rarity_icon = rarity_colors.get(r["rarity"], "⬜")
-        date_str = r["purchased_at"].strftime("%Y-%m-%d") if r["purchased_at"] else "Unknown"
-        desc += f"{icon} {rarity_icon} **{r['item_name']}** _{r['rarity']}_\n"
-        if r["description"]:
-            desc += f"  _{r['description']}_\n"
-        desc += f"  Purchased: {date_str}\n\n"
+
     embed = discord.Embed(
         title=f"🎒 {interaction.user.display_name}'s Inventory",
-        description=desc[:3900],
         color=discord.Color.blue(),
     )
-    embed.set_footer(text=f"{len(rows)} item(s) • {mode_label(guild_id)}")
+
+    # Badges field.
+    if badge_rows:
+        badge_lines = []
+        for r in badge_rows:
+            rarity_icon = rarity_icons.get(r["rarity"], "⬜")
+            date_str = r["awarded_at"].strftime("%Y-%m-%d") if r["awarded_at"] else "?"
+            source_tag = f" _{r['source']}_" if r["source"] != "system" else ""
+            badge_lines.append(
+                f"🏅 {rarity_icon} **{r['name']}** — _{r['rarity']}_{source_tag} | {date_str}"
+            )
+        embed.add_field(
+            name=f"🏅 Badges ({len(badge_rows)})",
+            value="\n".join(badge_lines)[:1024],
+            inline=False,
+        )
+
+    # Discord roles field.
+    if discord_roles:
+        role_lines = [f"👑 {r.mention}" for r in discord_roles[:20]]
+        if len(discord_roles) > 20:
+            role_lines.append(f"_...and {len(discord_roles) - 20} more_")
+        embed.add_field(
+            name=f"👑 Discord Roles ({len(discord_roles)})",
+            value="\n".join(role_lines)[:1024],
+            inline=False,
+        )
+
+    # Other shop items field (titles, cosmetics, trophies).
+    other_items = [r for r in shop_rows if r["category"] not in ("badge", "role")]
+    if other_items:
+        item_lines = []
+        for r in other_items:
+            icon = category_icons.get(r["category"], "🛍️")
+            rarity_icon = rarity_icons.get(r["rarity"], "⬜")
+            date_str = r["purchased_at"].strftime("%Y-%m-%d") if r["purchased_at"] else "?"
+            item_lines.append(f"{icon} {rarity_icon} **{r['item_name']}** — _{r['rarity']}_ | {date_str}")
+        embed.add_field(
+            name=f"🛍️ Other Items ({len(other_items)})",
+            value="\n".join(item_lines)[:1024],
+            inline=False,
+        )
+
+    embed.set_footer(text=f"{total_items} total item(s) • {mode_label(guild_id)}")
     await interaction.response.send_message(embed=embed)
 
 
@@ -2986,9 +3375,10 @@ async def inventory(interaction: discord.Interaction):
 # /buyitem — Purchase an item from the shop
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="buyitem", description="Purchase an item from the EAS shop.")
-@app_commands.describe(item_id="The ID number of the item to purchase (from /shop)")
-async def buyitem(interaction: discord.Interaction, item_id: int):
+@bot.tree.command(name="buyitem", description="Purchase an item from the EAS shop by name.")
+@app_commands.describe(item_name="The name of the item to purchase (from /shop)")
+async def buyitem(interaction: discord.Interaction, item_name: str):
+    """Purchase a shop item by name. Handles badge awards and Discord role assignments."""
     pool = await validate_guild_and_get_pool(interaction)
     if pool is None:
         return
@@ -2996,20 +3386,31 @@ async def buyitem(interaction: discord.Interaction, item_id: int):
     if not await is_registered(guild_id, interaction.user.id, pool):
         await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
         return
+    await ensure_user(guild_id, interaction.user.id, pool)
+
     async with pool.acquire() as db:
+        # Look up item by name (case-insensitive).
         item = await db.fetchrow(
-            "SELECT * FROM market_shop_items WHERE id=$1 AND active=TRUE;", item_id
+            "SELECT * FROM market_shop_items WHERE LOWER(item_name)=LOWER($1) AND active=TRUE;",
+            item_name.strip(),
         )
         if not item:
-            await send_embed(interaction, "❌ Item Not Found",
-                             f"No active shop item with ID `{item_id}`. Use `/shop` to browse.", discord.Color.red(), True)
+            await send_embed(
+                interaction, "❌ Item Not Found",
+                f"No active shop item named `{item_name}`. Use `/shop` to browse available items.",
+                discord.Color.red(), True,
+            )
             return
+
+        item_id = item["id"]
+
         # Check stock for limited items.
         if item["limited"] and item["current_stock"] is not None and item["current_stock"] <= 0:
             await send_embed(interaction, "❌ Out of Stock",
                              f"**{item['item_name']}** is sold out.", discord.Color.red(), True)
             return
-        # Check if already owned.
+
+        # Check if already owned in market_user_items.
         already_owned = await db.fetchval(
             "SELECT id FROM market_user_items WHERE guild_id=$1 AND user_id=$2 AND item_id=$3;",
             guild_id, interaction.user.id, item_id,
@@ -3018,48 +3419,95 @@ async def buyitem(interaction: discord.Interaction, item_id: int):
             await send_embed(interaction, "❌ Already Owned",
                              f"You already own **{item['item_name']}**.", discord.Color.orange(), True)
             return
+
         # Check balance.
         bal = await db.fetchval(
             "SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;",
             guild_id, interaction.user.id,
         )
         if bal is None or bal < item["price"]:
-            await send_embed(interaction, "❌ Insufficient Funds",
-                             f"**{item['item_name']}** costs **{money(item['price'])}** but you have **{money(bal or 0)}**.",
-                             discord.Color.red(), True)
+            await send_embed(
+                interaction, "❌ Insufficient Funds",
+                f"**{item['item_name']}** costs **{money(item['price'])}** but you only have **{money(bal or 0)}**.",
+                discord.Color.red(), True,
+            )
             return
-        # Deduct balance and record purchase.
+
+        # Deduct balance.
         await db.execute(
             "UPDATE market_users SET balance=balance-$1 WHERE guild_id=$2 AND user_id=$3;",
             item["price"], guild_id, interaction.user.id,
         )
+        # Record in market_user_items.
         await db.execute(
             "INSERT INTO market_user_items (guild_id, user_id, item_id) VALUES ($1,$2,$3);",
             guild_id, interaction.user.id, item_id,
         )
+        # Log transaction.
         await db.execute(
             "INSERT INTO market_transactions (guild_id,investor_id,type,total) VALUES ($1,$2,'shop_purchase',$3);",
             guild_id, interaction.user.id, item["price"],
         )
-        # Decrement stock for limited items.
+        # Decrement stock for limited items and increment total_bought.
         if item["limited"] and item["current_stock"] is not None:
             await db.execute(
-                "UPDATE market_shop_items SET current_stock=current_stock-1 WHERE id=$1;", item_id
+                "UPDATE market_shop_items SET current_stock=current_stock-1, total_bought=total_bought+1 WHERE id=$1;",
+                item_id,
+            )
+        else:
+            await db.execute(
+                "UPDATE market_shop_items SET total_bought=total_bought+1 WHERE id=$1;",
+                item_id,
             )
         new_bal = await db.fetchval(
             "SELECT balance FROM market_users WHERE guild_id=$1 AND user_id=$2;",
             guild_id, interaction.user.id,
         )
+
     await update_wealth_role(guild_id, interaction.user.id, int(new_bal), pool)
-    category_icons = {"badge": "🏅", "title": "📛", "cosmetic": "🎨", "trophy": "🏆"}
-    icon = category_icons.get(item["category"], "🛍️")
+
+    # Handle category-specific side effects.
+    category = item["category"]
+    extra_msg = ""
+
+    if category == "badge":
+        badge_id = item["badge_id"]
+        if badge_id:
+            success, badge_msg = await handle_badge_purchase(guild_id, interaction.user.id, badge_id, pool)
+            extra_msg = f"\n\n🏅 **Badge:** {badge_msg}"
+        else:
+            extra_msg = "\n\n🏅 Badge awarded to your profile!"
+
+    elif category == "role":
+        # Derive role name key from item_name (strip trailing _role suffix for display).
+        role_key = item["item_name"]
+        success, role_msg = await handle_role_purchase(guild_id, interaction.user.id, role_key, pool)
+        if success:
+            extra_msg = f"\n\n👑 **Role:** {role_msg}"
+        else:
+            extra_msg = f"\n\n⚠️ **Role:** {role_msg}"
+
+    category_icons = {"badge": "🏅", "title": "📛", "cosmetic": "🎨", "trophy": "🏆", "role": "👑"}
+    icon = category_icons.get(category, "🛍️")
+    rarity_colors = {
+        "common": discord.Color.light_grey(),
+        "uncommon": discord.Color.green(),
+        "rare": discord.Color.blue(),
+        "epic": discord.Color.purple(),
+        "legendary": discord.Color.gold(),
+        "mythic": discord.Color.red(),
+    }
+    embed_color = rarity_colors.get(item["rarity"], discord.Color.green())
+
     desc = (
         f"{icon} **{item['item_name']}** purchased!\n\n"
         f"**Price Paid:** {money(item['price'])}\n"
-        f"**New Balance:** {money(int(new_bal))}\n\n"
+        f"**New Balance:** {money(int(new_bal))}\n"
+        f"**Rarity:** {item['rarity'].capitalize()}"
+        f"{extra_msg}\n\n"
         f"_{item['description'] or 'No description.'}_"
     )
-    embed = discord.Embed(title="✅ Item Purchased", description=desc, color=discord.Color.green())
+    embed = discord.Embed(title="✅ Item Purchased", description=desc, color=embed_color)
     embed.set_footer(text=mode_label(guild_id))
     await interaction.response.send_message(embed=embed)
 
@@ -3892,9 +4340,9 @@ async def marketcommands_updated(interaction: discord.Interaction, page: int = 1
             "💹 Trading & Shop Commands",
             "`/buy <player> <shares>` — Buy shares of a top 10 player\n"
             "`/sell <player> <shares>` — Sell shares (3% tax)\n"
-            "`/buyitem <item_id>` — Purchase an item from the shop\n"
+            "`/buyitem <item_name>` — Purchase an item from the shop by name\n"
             "`/resellitem <item_id>` — Resell an item for a partial refund\n"
-            "`/inventory` — View your purchased items\n"
+            "`/inventory` — View your badges, roles, and purchased items\n"
             "`/topstocks` — Highest priced stocks\n"
             "`/gainers` — Recent biggest gainers\n"
             "`/losers` — Recent biggest losers",
