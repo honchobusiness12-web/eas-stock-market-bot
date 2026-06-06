@@ -1848,6 +1848,30 @@ async def send_embed(interaction: discord.Interaction, title: str, description: 
     await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
 
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Global error handler — catches CheckFailure from permission decorators."""
+    if isinstance(error, app_commands.CheckFailure):
+        cmd_name = interaction.command.name if interaction.command else "unknown"
+        # Determine whether this is a staff or developer command based on the
+        # check that was applied, and give a contextual error message.
+        if cmd_name in {"givepoints", "takepoints", "resetbalance", "marketsimulate",
+                        "marketresettest", "marketforceupdate", "synccommands"}:
+            title = "❌ Developer Only"
+            desc = f"Only the bot developer can use `/{cmd_name}`."
+        else:
+            title = "❌ Staff Only"
+            desc = f"You need a staff role to use `/{cmd_name}`."
+        embed = discord.Embed(title=title, description=desc, color=discord.Color.red())
+        try:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except discord.InteractionResponded:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        # Re-raise unexpected errors so they surface in logs.
+        raise error
+
+
 # ---------------------------------------------------------------------------
 # Badge and role purchase handlers
 # ---------------------------------------------------------------------------
@@ -2777,6 +2801,7 @@ async def transactions(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="syncmarket", description="Staff: Sync top 10 market players from ranked database.")
+@app_commands.checks.check(lambda i: is_staff(i.user))
 async def syncmarket(interaction: discord.Interaction):
     if not is_staff(interaction.user):
         await send_embed(interaction, "❌ No Permission", "Staff only.", discord.Color.red(), True); return
@@ -2792,6 +2817,7 @@ async def syncmarket(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="marketopen", description="Staff: Open market trading.")
+@app_commands.checks.check(lambda i: is_staff(i.user))
 async def marketopen(interaction: discord.Interaction):
     if not is_staff(interaction.user):
         await send_embed(interaction, "❌ No Permission", "Staff only.", discord.Color.red(), True); return
@@ -2807,6 +2833,7 @@ async def marketopen(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="marketclose", description="Staff: Close market trading.")
+@app_commands.checks.check(lambda i: is_staff(i.user))
 async def marketclose(interaction: discord.Interaction):
     if not is_staff(interaction.user):
         await send_embed(interaction, "❌ No Permission", "Staff only.", discord.Color.red(), True); return
@@ -2823,6 +2850,7 @@ async def marketclose(interaction: discord.Interaction):
 
 @bot.tree.command(name="logresult", description="Staff: Manually update stock from ranked performance.")
 @app_commands.describe(result="win or loss")
+@app_commands.checks.check(lambda i: is_staff(i.user))
 async def logresult(interaction: discord.Interaction, user: discord.Member, result: str, mvp: bool = False, high_kills: bool = False, upset: bool = False):
     if not is_staff(interaction.user):
         await send_embed(interaction, "❌ No Permission", "Staff only.", discord.Color.red(), True); return
@@ -2854,6 +2882,7 @@ async def logresult(interaction: discord.Interaction, user: discord.Member, resu
 
 
 @bot.tree.command(name="freezeportfolio", description="Staff: Record a portfolio freeze action for a user.")
+@app_commands.checks.check(lambda i: is_staff(i.user))
 async def freezeportfolio(interaction: discord.Interaction, user: discord.Member):
     """Log a portfolio freeze action in the transaction history."""
     if not is_staff(interaction.user):
@@ -2871,6 +2900,7 @@ async def freezeportfolio(interaction: discord.Interaction, user: discord.Member
 
 
 @bot.tree.command(name="unfreezeportfolio", description="Staff: Record a portfolio unfreeze action for a user.")
+@app_commands.checks.check(lambda i: is_staff(i.user))
 async def unfreezeportfolio(interaction: discord.Interaction, user: discord.Member):
     """Log a portfolio unfreeze action in the transaction history."""
     if not is_staff(interaction.user):
@@ -2888,6 +2918,7 @@ async def unfreezeportfolio(interaction: discord.Interaction, user: discord.Memb
 
 
 @bot.tree.command(name="givepoints", description="Developer: Give StarPoints to a user.")
+@app_commands.checks.check(lambda i: is_developer(i.user))
 async def givepoints(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not is_developer(interaction.user):
         await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True); return
@@ -2905,6 +2936,7 @@ async def givepoints(interaction: discord.Interaction, user: discord.Member, amo
 
 
 @bot.tree.command(name="takepoints", description="Developer: Take StarPoints from a user.")
+@app_commands.checks.check(lambda i: is_developer(i.user))
 async def takepoints(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not is_developer(interaction.user):
         await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True); return
@@ -2922,6 +2954,7 @@ async def takepoints(interaction: discord.Interaction, user: discord.Member, amo
 
 
 @bot.tree.command(name="resetbalance", description="Developer: Reset a user's StarPoints balance.")
+@app_commands.checks.check(lambda i: is_developer(i.user))
 async def resetbalance(interaction: discord.Interaction, user: discord.Member, amount: int = STARTING_SP):
     if not is_developer(interaction.user):
         await send_embed(interaction, "❌ Developer Only", "Only the developer can use this command.", discord.Color.red(), True); return
@@ -2943,6 +2976,7 @@ async def resetbalance(interaction: discord.Interaction, user: discord.Member, a
 # ---------------------------------------------------------------------------
 
 @bot.tree.command(name="marketsimulate", description="Developer: Manually trigger market simulation (test server only).")
+@app_commands.checks.check(lambda i: is_developer(i.user))
 async def marketsimulate(interaction: discord.Interaction):
     """Advance fake player CRs and update stock prices in the test server."""
     if not is_developer(interaction.user):
@@ -2988,6 +3022,7 @@ async def marketsimulate(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="marketresettest", description="Developer: Reset the test database to initial state.")
+@app_commands.checks.check(lambda i: is_developer(i.user))
 async def marketresettest(interaction: discord.Interaction):
     """Clear all test-server market data and re-seed fake players."""
     if not is_developer(interaction.user):
@@ -3082,6 +3117,7 @@ async def marketstatus(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 
 @bot.tree.command(name="marketforceupdate", description="Developer: Force an immediate market update cycle.")
+@app_commands.checks.check(lambda i: is_developer(i.user))
 async def marketforceupdate(interaction: discord.Interaction):
     """Force an immediate top-10 sync (main) or simulation tick (test)."""
     if not is_developer(interaction.user):
@@ -3116,6 +3152,7 @@ async def marketforceupdate(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 
 @bot.tree.command(name="synccommands", description="Developer: Re-register all slash commands to both guilds.")
+@app_commands.checks.check(lambda i: is_developer(i.user))
 async def synccommands(interaction: discord.Interaction):
     """Manually re-sync all slash commands to testing and main guilds.
 
@@ -3155,45 +3192,6 @@ async def synccommands(interaction: discord.Interaction):
     embed = discord.Embed(title="🔄 Slash Command Sync", description=desc, color=discord.Color.blurple())
     embed.set_footer(text=f"✅ Synced {test_count} commands to testing guild")
     await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-# ---------------------------------------------------------------------------
-# /starpoints — View your StarPoints balance (alias for /balance)
-# ---------------------------------------------------------------------------
-
-@bot.tree.command(name="starpoints", description="View your StarPoints balance and wealth role.")
-async def starpoints(interaction: discord.Interaction):
-    """Alias for /balance — shows SP balance and wealth role."""
-    pool = await validate_guild_and_get_pool(interaction)
-    if pool is None:
-        return
-    guild_id = interaction.guild.id
-    if not await is_registered(guild_id, interaction.user.id, pool):
-        await send_embed(interaction, "❌ Not Registered", NOT_REGISTERED_DESC, discord.Color.red(), True)
-        return
-    await ensure_user(guild_id, interaction.user.id, pool)
-    async with pool.acquire() as db:
-        row = await db.fetchrow(
-            "SELECT balance, wealth_role FROM market_users WHERE guild_id=$1 AND user_id=$2;",
-            guild_id, interaction.user.id,
-        )
-    bal = int(row["balance"])
-    role = row["wealth_role"] or "None"
-    next_role: Optional[str] = None
-    next_threshold: Optional[int] = None
-    for role_name, threshold in reversed(WEALTH_ROLES):
-        if bal < threshold:
-            next_role = role_name
-            next_threshold = threshold
-    desc = f"**Balance:** {money(bal)}\n**Wealth Role:** {role}\n"
-    if next_role and next_threshold:
-        needed = next_threshold - bal
-        desc += f"**Next Role:** {next_role} (need {money(needed)} more)"
-    else:
-        desc += "**Status:** 🏆 Maximum wealth role achieved!"
-    embed = discord.Embed(title="⭐ StarPoints Balance", description=desc, color=discord.Color.gold())
-    embed.set_footer(text=f"Guild: {interaction.guild.name} • {mode_label(guild_id)}")
-    await interaction.response.send_message(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -4319,7 +4317,6 @@ async def marketcommands_updated(interaction: discord.Interaction, page: int = 1
             "`/register` — Accept Terms & Conditions and register\n"
             "`/ping` — Bot status, latency & uptime\n"
             "`/balance` — View your SP balance & wealth role\n"
-            "`/starpoints` — View your StarPoints balance\n"
             "`/starpointprice` — View economy rates & wealth thresholds\n"
             "`/daily` — Claim your daily $50,000 SP reward\n"
             "`/marketcommands` — This command list\n\n"
@@ -4336,6 +4333,7 @@ async def marketcommands_updated(interaction: discord.Interaction, page: int = 1
             "`/portfolio` — View your holdings & P/L\n"
             "`/transactions` — Your recent trade history",
         ),
+
         3: (
             "💹 Trading & Shop Commands",
             "`/buy <player> <shares>` — Buy shares of a top 10 player\n"
